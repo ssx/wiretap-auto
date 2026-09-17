@@ -4,29 +4,24 @@ declare(strict_types=1);
 
 namespace Ssx\Wiretap\Auto;
 
-use Ssx\Wiretap\Blocklist\Blocklist;
-use Ssx\Wiretap\Blocklist\EnvBlocklistProvider;
-use Ssx\Wiretap\Blocklist\PresetBlocklistProvider;
-use Ssx\Wiretap\Contract\ExchangeSink;
 use Ssx\Wiretap\Recorder;
-use Ssx\Wiretap\Redaction\RedactionConfig;
-use Ssx\Wiretap\Redaction\Redactor;
-use Ssx\Wiretap\Sampler;
-use Ssx\Wiretap\Sink\NdjsonFileSink;
-use Ssx\Wiretap\Sink\NullSink;
+use Ssx\Wiretap\Wiretap as Core;
 
 /**
- * The zero-configuration entry point.
+ * Registers the hooks, and nothing else.
  *
- * A static holder is pragmatically necessary here: the hooks fire below any
- * container, in code that cannot be injected into. Everything it holds is
- * replaceable, so a framework integration can hand it a properly wired
- * recorder and the hooks will use that instead.
+ * This class used to keep its own static Recorder. That was a mistake: two
+ * global holders means a framework can wire up a properly configured recorder,
+ * set it on one, and have the hooks go on writing to the other. The recorder
+ * now lives in Ssx\Wiretap\Wiretap and this delegates to it, so there is
+ * exactly one.
+ *
+ * The recorder-related methods are kept as pass-throughs rather than removed,
+ * because they are the documented way to configure this package and breaking
+ * them would gain nothing.
  */
 final class Wiretap
 {
-    private static ?Recorder $recorder = null;
-
     private static ?OtelHookDriver $driver = null;
 
     /**
@@ -35,7 +30,7 @@ final class Wiretap
     public static function boot(?Recorder $recorder = null): ?OtelHookDriver
     {
         if ($recorder !== null) {
-            self::$recorder = $recorder;
+            Core::setRecorder($recorder);
         }
 
         // Hooks install once per process and cannot be installed again once
@@ -45,30 +40,23 @@ final class Wiretap
             return self::$driver;
         }
 
-        $driver = new OtelHookDriver(static fn (): Recorder => self::recorder());
+        $driver = new OtelHookDriver(static fn (): Recorder => Core::recorder());
 
-        if (!$driver->isAvailable()) {
-            // No extension. The package is inert rather than broken, and
-            // `doctor` explains why nothing is being captured.
-            self::$driver = $driver;
-
-            return $driver;
+        if ($driver->isAvailable()) {
+            $driver->register();
         }
 
-        $driver->register();
-        self::$driver = $driver;
-
-        return $driver;
+        return self::$driver = $driver;
     }
 
     public static function recorder(): Recorder
     {
-        return self::$recorder ??= self::defaultRecorder();
+        return Core::recorder();
     }
 
     public static function setRecorder(Recorder $recorder): void
     {
-        self::$recorder = $recorder;
+        Core::setRecorder($recorder);
     }
 
     public static function driver(): ?OtelHookDriver
@@ -78,18 +66,18 @@ final class Wiretap
 
     public static function isCapturing(): bool
     {
-        return self::$driver?->isRegistered() === true && self::recorder()->isEnabled();
+        return self::$driver?->isRegistered() === true && Core::recorder()->isEnabled();
     }
 
     /**
-     * Human-readable status, for `wiretap doctor` and for the "why is nothing
-     * being recorded" question that otherwise costs an afternoon.
+     * Human-readable status, for the "why is nothing being recorded" question
+     * that otherwise costs an afternoon.
      *
      * @return array<string, string>
      */
     public static function diagnostics(): array
     {
-        $recorder = self::recorder();
+        $recorder = Core::recorder();
         $blocklist = $recorder->blocklist();
 
         $diagnostics = self::$driver?->diagnostics() ?? [
@@ -112,50 +100,14 @@ final class Wiretap
         return $diagnostics;
     }
 
+    /**
+     * Clears the hook driver reference. The hooks themselves cannot be
+     * uninstalled — they are process-wide — so this is for tests that need a
+     * fresh driver, not a way to stop capturing. Use the recorder for that.
+     */
     public static function reset(): void
     {
-        self::$recorder = null;
         self::$driver = null;
-    }
-
-    /**
-     * Sensible defaults for someone who has only run `composer require`.
-     *
-     * Capture is off unless WIRETAP_ENABLED is truthy. This is a debugging
-     * tool that records personal data, and a package that starts recording
-     * the moment it is installed would be indefensible.
-     */
-    private static function defaultRecorder(): Recorder
-    {
-        $enabled = filter_var(getenv('WIRETAP_ENABLED') ?: 'false', FILTER_VALIDATE_BOOL);
-
-        return new Recorder(
-            sink: $enabled ? self::defaultSink() : new NullSink(),
-            blocklist: new Blocklist([
-                new PresetBlocklistProvider([
-                    PresetBlocklistProvider::PAYMENT_GATEWAYS,
-                    PresetBlocklistProvider::CLOUD_METADATA,
-                ]),
-                new EnvBlocklistProvider(),
-            ]),
-            redactor: new Redactor(new RedactionConfig(
-                maxBodyBytes: (int) (getenv('WIRETAP_BODY_LIMIT') ?: 65536),
-            )),
-            sampler: new Sampler(
-                rateBasisPoints: (int) (getenv('WIRETAP_SAMPLE_BP') ?: 10000),
-            ),
-            enabled: $enabled,
-        );
-    }
-
-    private static function defaultSink(): ExchangeSink
-    {
-        $path = getenv('WIRETAP_PATH');
-
-        if (!is_string($path) || $path === '') {
-            $path = sys_get_temp_dir() . '/wiretap';
-        }
-
-        return new NdjsonFileSink($path);
+        Core::reset();
     }
 }
