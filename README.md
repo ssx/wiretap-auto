@@ -24,9 +24,39 @@ $body = curl_exec($ch);
 $response = (new GuzzleHttp\Client())->get('https://api.example.com/v1');
 ```
 
-Guzzle's default handler is `CurlMultiHandler`, so hooking curl catches Guzzle
-for free. There is one writer at the lowest layer rather than two recorders
-that then have to be de-duplicated.
+## ⚠️ Synchronous transfers only
+
+**This package hooks `curl_exec`. It does not hook `curl_multi_*`, so anything
+using the multi interface is not captured.**
+
+| | Captured by this package |
+| --- | --- |
+| `curl_exec()` anywhere, including vendor code | yes |
+| Guzzle, synchronous (`$client->get()`) | yes |
+| Guzzle, async (`getAsync()`, `Pool`, `requestAsync`) | **no** |
+| Symfony HttpClient (`CurlHttpClient`) | **no** |
+
+Guzzle's default handler is `Proxy::wrapSync(CurlMultiHandler, CurlHandler)` —
+only the synchronous branch reaches `curl_exec`. Symfony's `CurlHttpClient` is
+multi-only and never calls it at all.
+
+Measured, not assumed:
+
+```
+sync  : 1 recorded
+async : 0 recorded (getAsync->wait)
+pool  : 0 recorded (2 concurrent)
+```
+
+If you own the client, the bridge packages cover async properly —
+[`ssx/wiretap-guzzle`](https://github.com/ssx/wiretap-guzzle) captures sync,
+async and pools; [`ssx/wiretap-symfony`](https://github.com/ssx/wiretap-symfony)
+decorates Symfony's client.
+
+The gap that remains is **vendor code you cannot edit, making async calls**.
+That is precisely what this package exists for, so the limitation is a real
+one and not a footnote. Hooking the multi interface is planned; until then,
+`wiretap doctor` reports it.
 
 ## How it works
 
