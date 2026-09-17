@@ -27,7 +27,15 @@ use Ssx\Wiretap\TransferError;
  */
 final readonly class ExchangeFactory
 {
-    public function __construct(private int $maxBodyBytes = 65536)
+    /**
+     * @param int $maxBodyBytes A hard memory ceiling, not the redaction limit.
+     *
+     * Capturing only 64 KiB here handed the redactor a truncated JSON body it
+     * could not parse, so configured body-path rules silently did nothing.
+     * Reading a larger bounded amount lets structural redaction run; the core
+     * truncates to its own limit afterwards.
+     */
+    public function __construct(private int $maxBodyBytes = 1_048_576)
     {
     }
 
@@ -109,7 +117,7 @@ final readonly class ExchangeFactory
             return CapturedBody::none();
         }
 
-        $contentType = $this->contentTypeFromLines($state->requestHeaderLines());
+        $contentType = $state->requestContentType();
         $size = strlen($body);
 
         if ($size > $this->maxBodyBytes) {
@@ -148,6 +156,19 @@ final readonly class ExchangeFactory
             return CapturedBody::none();
         }
 
+        // With CURLOPT_HEADER the return value is headers followed by the
+        // body, and a redirect chain prepends one block per hop. Recording the
+        // whole string as the body embedded unredacted headers — including
+        // Set-Cookie from intermediate hops — where header redaction never
+        // looks. Splitting it reliably across redirects and 1xx responses is
+        // not something to guess at, so the body is omitted instead.
+        if ($state->returnsHeadersInBody()) {
+            return CapturedBody::omitted(
+                CapturedBody::OMITTED_NOT_READABLE,
+                strlen($result),
+            );
+        }
+
         $contentType = Headers::fromRaw($this->lastResponseHeaderBlock($state->responseHeaders()))
             ->first('Content-Type');
 
@@ -184,17 +205,4 @@ final readonly class ExchangeFactory
         return $blocks === [] ? '' : (string) end($blocks);
     }
 
-    /**
-     * @param list<string> $lines
-     */
-    private function contentTypeFromLines(array $lines): ?string
-    {
-        foreach ($lines as $line) {
-            if (stripos($line, 'content-type:') === 0) {
-                return trim(substr($line, 13));
-            }
-        }
-
-        return null;
-    }
 }

@@ -119,6 +119,10 @@ final class OtelHookDriver implements HookDriver
             }
 
             if (isset($params[1]) && is_int($params[1])) {
+                // Recording the option also clears headersInstalled when the
+                // application replaces CURLOPT_HEADERFUNCTION, so our wrapper
+                // is reinstalled on the next captured transfer rather than
+                // leaving the handle with no header capture at all.
                 $this->registry->for($params[0])->set($params[1], $params[2] ?? null);
             }
         });

@@ -20,7 +20,7 @@
     "require": {
         "php": "^8.2",
         "ext-curl": "*",
-        "ssx/wiretap": "~0.0.2 || dev-main"
+        "ssx/wiretap": "~0.0.3 || dev-main"
     },
     "require-dev": {
         "pestphp/pest": "^2.34",

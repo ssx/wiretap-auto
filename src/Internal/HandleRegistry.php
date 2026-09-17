@@ -7,32 +7,38 @@ namespace Ssx\Wiretap\Auto\Internal;
 /**
  * Tracks the shadow state of every live curl handle.
  *
- * Keyed by the CurlHandle object itself. `SplObjectStorage` holds a strong
- * reference, so handles are removed on `curl_close()` and, as a backstop, the
- * registry is capped — a long-running worker that leaks handles must not turn
- * into a memory leak in the instrumentation as well.
+ * Keyed by the CurlHandle object in a WeakMap, so tracking a handle does not
+ * keep it alive. SplObjectStorage held a strong reference, which had two
+ * consequences worth spelling out:
+ *
+ *  - An application that dropped its last reference to a handle, rather than
+ *    calling curl_close(), had that handle, its callbacks and its shadowed
+ *    POST body retained until the process ended. Instrumentation changed the
+ *    lifetime of the thing it was observing.
+ *  - curl_copy_handle() attached copies without consulting the capacity limit,
+ *    so repeatedly copying and dropping handles grew without bound regardless
+ *    of maxHandles.
+ *
+ * A WeakMap fixes both: entries disappear when the application is finished
+ * with a handle, and there is nothing to leak. The cap remains as a backstop.
  */
 final class HandleRegistry
 {
-    /** @var \SplObjectStorage<object, HandleState> */
-    private \SplObjectStorage $handles;
+    /** @var \WeakMap<object, HandleState> */
+    private \WeakMap $handles;
 
     public function __construct(private readonly int $maxHandles = 1024)
     {
-        $this->handles = new \SplObjectStorage();
+        /** @var \WeakMap<object, HandleState> $map */
+        $map = new \WeakMap();
+        $this->handles = $map;
     }
 
     public function for(object $handle): HandleState
     {
-        if (!$this->handles->contains($handle)) {
-            if ($this->handles->count() >= $this->maxHandles) {
-                // Something is leaking handles. Drop everything rather than
-                // grow without bound; the worst case is losing capture for
-                // in-flight transfers, which beats exhausting memory.
-                $this->handles = new \SplObjectStorage();
-            }
-
-            $this->handles->attach($handle, new HandleState());
+        if (!$this->handles->offsetExists($handle)) {
+            $this->enforceCapacity();
+            $this->handles[$handle] = new HandleState();
         }
 
         return $this->handles[$handle];
@@ -40,30 +46,53 @@ final class HandleRegistry
 
     public function has(object $handle): bool
     {
-        return $this->handles->contains($handle);
+        return $this->handles->offsetExists($handle);
     }
 
     public function copy(object $from, object $to): void
     {
-        if ($this->handles->contains($from)) {
-            $this->handles->attach($to, $this->handles[$from]->copy());
+        if (!$this->handles->offsetExists($from)) {
+            return;
         }
+
+        // Read the source state before the capacity check: enforcing capacity
+        // can clear the map, and the source would no longer be in it.
+        $copied = $this->handles[$from]->copy();
+
+        // Copies go through the same capacity check as any other insertion.
+        $this->enforceCapacity();
+
+        $this->handles[$to] = $copied;
     }
 
     public function forget(object $handle): void
     {
-        if ($this->handles->contains($handle)) {
-            $this->handles->detach($handle);
+        if ($this->handles->offsetExists($handle)) {
+            $this->handles->offsetUnset($handle);
         }
     }
 
     public function count(): int
     {
-        return $this->handles->count();
+        return count($this->handles);
     }
 
     public function clear(): void
     {
-        $this->handles = new \SplObjectStorage();
+        /** @var \WeakMap<object, HandleState> $map */
+        $map = new \WeakMap();
+        $this->handles = $map;
+    }
+
+    /**
+     * Something is holding far more handles than any application needs.
+     * Dropping the shadow state costs capture for in-flight transfers, which
+     * beats unbounded growth inside instrumentation.
+     */
+    private function enforceCapacity(): void
+    {
+        if (count($this->handles) >= $this->maxHandles) {
+            $this->clear();
+        }
     }
 }
