@@ -35,8 +35,26 @@ final class HandleState
 
         // Remember the application's own header callback so ours can chain
         // onto it rather than silently replacing it.
-        if ($option === CURLOPT_HEADERFUNCTION && is_callable($value)) {
-            $this->appHeaderFunction = $value;
+        if ($option === CURLOPT_HEADERFUNCTION) {
+            $this->appHeaderFunction = is_callable($value) ? $value : null;
+
+            // The application replaced the callback on a reused handle, which
+            // removed our wrapper. Without this, headersInstalled stayed true
+            // and every later response on that handle was recorded with no
+            // headers at all — and a body with no content type slips past the
+            // redactor's binary gate.
+            $this->headersInstalled = false;
+        }
+
+        // curl treats these as mutually exclusive method switches. Tracking
+        // only the last-set option reported POST with a stale body after the
+        // caller switched back to GET.
+        if ($option === CURLOPT_HTTPGET && $value) {
+            unset($this->options[CURLOPT_POST], $this->options[CURLOPT_POSTFIELDS], $this->options[CURLOPT_PUT]);
+        }
+
+        if ($option === CURLOPT_POST && $value) {
+            unset($this->options[CURLOPT_HTTPGET], $this->options[CURLOPT_NOBODY]);
         }
     }
 
@@ -73,15 +91,18 @@ final class HandleState
             return strtoupper($this->options[CURLOPT_CUSTOMREQUEST]);
         }
 
-        if (($this->options[CURLOPT_NOBODY] ?? false) === true) {
+        // curl accepts 1 as well as true. A strict === true check reported
+        // GET for `curl_setopt($ch, CURLOPT_POST, 1)`, which is the form most
+        // code in the wild uses.
+        if ($this->isOn(CURLOPT_NOBODY)) {
             return 'HEAD';
         }
 
-        if (($this->options[CURLOPT_POST] ?? false) === true || isset($this->options[CURLOPT_POSTFIELDS])) {
+        if ($this->isOn(CURLOPT_POST) || isset($this->options[CURLOPT_POSTFIELDS])) {
             return 'POST';
         }
 
-        if (isset($this->options[CURLOPT_PUT]) && $this->options[CURLOPT_PUT] === true) {
+        if ($this->isOn(CURLOPT_PUT)) {
             return 'PUT';
         }
 
@@ -95,6 +116,49 @@ final class HandleState
      * configured is not always what was transmitted — so those report null and
      * the exchange records an omission rather than a guess.
      */
+    private function isOn(int $option): bool
+    {
+        $value = $this->options[$option] ?? false;
+
+        return $value === true || $value === 1 || $value === '1';
+    }
+
+    /**
+     * The content type of the request body as curl will actually send it.
+     *
+     * An array of POSTFIELDS without an explicit Content-Type is sent as
+     * multipart. Reporting a null content type made the redactor try JSON
+     * parsing on a form-encoded reconstruction, so configured body-path rules
+     * did nothing at all.
+     */
+    public function requestContentType(): ?string
+    {
+        foreach ($this->requestHeaderLines() as $line) {
+            if (stripos($line, 'content-type:') === 0) {
+                return trim(substr($line, 13));
+            }
+        }
+
+        $fields = $this->options[CURLOPT_POSTFIELDS] ?? null;
+
+        if (is_array($fields)) {
+            return 'application/x-www-form-urlencoded';
+        }
+
+        return null;
+    }
+
+    /**
+     * CURLOPT_HEADER makes curl_exec() return the response headers prepended
+     * to the body. Treating that whole string as the body embedded unredacted
+     * headers — including Set-Cookie from intermediate redirects — inside the
+     * recorded body, where header redaction never looks.
+     */
+    public function returnsHeadersInBody(): bool
+    {
+        return $this->isOn(CURLOPT_HEADER);
+    }
+
     public function requestBody(): ?string
     {
         $fields = $this->options[CURLOPT_POSTFIELDS] ?? null;

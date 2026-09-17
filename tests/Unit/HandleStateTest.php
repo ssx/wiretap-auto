@@ -166,3 +166,99 @@ describe('the registry', function (): void {
         expect($registry->count())->toBeLessThanOrEqual(10);
     });
 });
+
+describe('hardening found by review', function (): void {
+    it('accepts 1 as well as true for boolean options', function (): void {
+        // curl_setopt($ch, CURLOPT_POST, 1) is the form most code uses, and a
+        // strict === true check reported it as GET.
+        $state = new HandleState();
+        $state->set(CURLOPT_POST, 1);
+
+        expect($state->method())->toBe('POST');
+    });
+
+    it('forgets a stale body when the caller switches back to GET', function (): void {
+        $state = new HandleState();
+        $state->set(CURLOPT_POSTFIELDS, 'old=secret');
+        $state->set(CURLOPT_HTTPGET, true);
+
+        expect($state->method())->toBe('GET')
+            ->and($state->requestBody())->toBeNull();
+    });
+
+    it('reports form encoding for an array body so structural rules can run', function (): void {
+        // A null content type made the redactor attempt JSON parsing on a
+        // form-encoded reconstruction, so body_paths did nothing.
+        $state = new HandleState();
+        $state->set(CURLOPT_POSTFIELDS, ['password' => 'ordinary-secret']);
+
+        expect($state->requestContentType())->toBe('application/x-www-form-urlencoded');
+    });
+
+    it('prefers an explicit Content-Type header over the inferred one', function (): void {
+        $state = new HandleState();
+        $state->set(CURLOPT_POSTFIELDS, ['a' => 1]);
+        $state->set(CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+
+        expect($state->requestContentType())->toBe('application/json');
+    });
+
+    it('knows when curl will return headers inside the body', function (): void {
+        $state = new HandleState();
+        $state->set(CURLOPT_HEADER, true);
+
+        expect($state->returnsHeadersInBody())->toBeTrue();
+    });
+
+    it('reinstalls header capture when the application replaces the callback', function (): void {
+        // On a reused handle the application's new callback removes our
+        // wrapper. headersInstalled staying true meant every later response on
+        // that handle recorded no headers, and a body with no content type
+        // slips past the redactor's binary gate.
+        $state = new HandleState();
+        $state->markHeadersInstalled();
+
+        expect($state->headersInstalled())->toBeTrue();
+
+        $state->set(CURLOPT_HEADERFUNCTION, static fn ($ch, string $line): int => strlen($line));
+
+        expect($state->headersInstalled())->toBeFalse();
+    });
+});
+
+describe('the registry holding handles weakly', function (): void {
+    it('does not keep a handle alive once the application drops it', function (): void {
+        // A strong reference changed the lifetime of the thing being observed:
+        // a handle released without curl_close() was retained, with its
+        // callbacks and shadowed POST body, until the process ended.
+        $registry = new HandleRegistry();
+        $handle = new stdClass();
+        $registry->for($handle)->set(CURLOPT_URL, 'https://api.example.com');
+        $weak = WeakReference::create($handle);
+
+        expect($registry->count())->toBe(1);
+
+        unset($handle);
+
+        expect($weak->get())->toBeNull()
+            ->and($registry->count())->toBe(0);
+    });
+
+    it('applies the capacity limit to copied handles too', function (): void {
+        // copy() attached without consulting maxHandles, so repeatedly copying
+        // grew without bound regardless of the cap.
+        $registry = new HandleRegistry(maxHandles: 4);
+        $source = new stdClass();
+        $registry->for($source);
+
+        $held = [];
+
+        for ($i = 0; $i < 40; ++$i) {
+            $copy = new stdClass();
+            $registry->copy($source, $copy);
+            $held[] = $copy;
+        }
+
+        expect($registry->count())->toBeLessThanOrEqual(4);
+    });
+});
