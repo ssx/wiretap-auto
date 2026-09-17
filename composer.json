@@ -1,0 +1,48 @@
+{
+    "name": "ssx/wiretap-auto",
+    "description": "Zero-configuration capture for wiretap. Hooks curl and Guzzle via ext-opentelemetry, including calls made by vendor code.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": ["http", "curl", "guzzle", "debugging", "instrumentation", "opentelemetry"],
+    "authors": [
+        {
+            "name": "Scott Robinson",
+            "email": "scott@dor.ky"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "ext-curl": "*",
+        "ssx/wiretap": "^0.1 || dev-main"
+    },
+    "require-dev": {
+        "pestphp/pest": "^2.34",
+        "phpstan/phpstan": "^1.11",
+        "guzzlehttp/guzzle": "^7.5"
+    },
+    "suggest": {
+        "ext-opentelemetry": "Required for capture. Without it this package is inert."
+    },
+    "repositories": [
+        { "type": "vcs", "url": "https://github.com/ssx/wiretap" }
+    ],
+    "autoload": {
+        "psr-4": {
+            "Ssx\\Wiretap\\Auto\\": "src/"
+        },
+        "files": [
+            "src/_register.php"
+        ]
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Ssx\\Wiretap\\Auto\\Tests\\": "tests/"
+        }
+    },
+    "config": {
+        "sort-packages": true,
+        "allow-plugins": { "pestphp/pest-plugin": true }
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true
+}

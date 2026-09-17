@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: PHP ${{ matrix.php }} (ext-opentelemetry ${{ matrix.otel }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.2', '8.3', '8.4']
+        otel: ['yes']
+        include:
+          # The package must be inert, not broken, when the extension is
+          # absent. Integration tests skip themselves; nothing may fatal.
+          - php: '8.2'
+            otel: 'no'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP with the extension
+        if: matrix.otel == 'yes'
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: curl, json, mbstring, opentelemetry
+          coverage: none
+
+      - name: Set up PHP without the extension
+        if: matrix.otel == 'no'
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: curl, json, mbstring
+          coverage: none
+
+      - name: Confirm extension state matches the matrix
+        run: |
+          if [ "${{ matrix.otel }}" = "yes" ]; then
+            php -m | grep -q opentelemetry || { echo "extension missing"; exit 1; }
+          else
+            php -m | grep -q opentelemetry && { echo "extension unexpectedly present"; exit 1; }
+          fi
+          exit 0
+
+      - name: Install dependencies
+        run: composer update --prefer-dist --no-interaction --no-progress
+
+      - name: Run tests
+        run: vendor/bin/pest
+
+  static-analysis:
+    name: PHPStan
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: curl, json, mbstring, opentelemetry
+          coverage: none
+
+      - name: Install dependencies
+        run: composer update --prefer-dist --no-interaction --no-progress
+
+      - name: Analyse
+        run: vendor/bin/phpstan analyse --no-progress
