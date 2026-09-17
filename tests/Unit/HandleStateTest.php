@@ -274,3 +274,17 @@ describe('custom request methods', function (): void {
         expect($state->method())->toBe('PropFind');
     });
 });
+
+describe('coverage diagnostics', function (): void {
+    it('states the async gap out loud', function (): void {
+        // The package exists to catch code you cannot edit, and it misses
+        // every async call. Someone debugging one that never appears should
+        // learn why from doctor, not from reading the source.
+        $keys = array_keys(\Ssx\Wiretap\Auto\Wiretap::diagnostics());
+
+        expect($keys)->toContain('curl_multi_* (async)');
+
+        expect(\Ssx\Wiretap\Auto\Wiretap::diagnostics()['curl_multi_* (async)'])
+            ->toContain('NOT captured');
+    });
+});

@@ -86,6 +86,13 @@ final class Wiretap
         ];
 
         $diagnostics['enabled'] = $recorder->isEnabled() ? 'yes' : 'no';
+
+        // Stated in diagnostics, not only in the README. Someone debugging an
+        // async call that never appears should be told why in the first place
+        // they look.
+        $diagnostics['curl_exec (sync)'] = 'captured';
+        $diagnostics['curl_multi_* (async)'] = 'NOT captured — async Guzzle, pools '
+            . 'and Symfony HttpClient are invisible to this package';
         $diagnostics['blocklist_patterns'] = (string) count($blocklist->patterns());
         $diagnostics['blocklist_failed_closed'] = $blocklist->hasFailedClosed() ? 'YES — blocking everything' : 'no';
 
