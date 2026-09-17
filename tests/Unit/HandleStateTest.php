@@ -15,7 +15,7 @@ describe('method inference', function (): void {
         'default'        => [[], 'GET'],
         'post flag'      => [[CURLOPT_POST => true], 'POST'],
         'postfields'     => [[CURLOPT_POSTFIELDS => 'a=1'], 'POST'],
-        'custom request' => [[CURLOPT_CUSTOMREQUEST => 'patch'], 'PATCH'],
+        'custom request' => [[CURLOPT_CUSTOMREQUEST => 'PATCH'], 'PATCH'],
         'nobody is HEAD' => [[CURLOPT_NOBODY => true], 'HEAD'],
     ]);
 
@@ -260,5 +260,17 @@ describe('the registry holding handles weakly', function (): void {
         }
 
         expect($registry->count())->toBeLessThanOrEqual(4);
+    });
+});
+
+describe('custom request methods', function (): void {
+    it('preserves the exact casing curl will send', function (): void {
+        // curl sends a custom method verbatim. Upper-casing it meant the
+        // record disagreed with the request that was actually made, and
+        // WebDAV and several vendor APIs use mixed-case verbs.
+        $state = new HandleState();
+        $state->set(CURLOPT_CUSTOMREQUEST, 'PropFind');
+
+        expect($state->method())->toBe('PropFind');
     });
 });
