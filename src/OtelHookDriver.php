@@ -236,8 +236,9 @@ final class OtelHookDriver implements HookDriver
             }
 
             $appCallback = $state->appHeaderFunction();
+            $appStream = $state->appHeaderStream();
 
-            curl_setopt($handle, CURLOPT_HEADERFUNCTION, function ($ch, string $line) use ($state, $appCallback): int {
+            curl_setopt($handle, CURLOPT_HEADERFUNCTION, function ($ch, string $line) use ($state, $appCallback, $appStream): int {
                 $state->appendResponseHeader($line);
 
                 // Chain, never replace. Returning anything but the byte count
@@ -245,6 +246,14 @@ final class OtelHookDriver implements HookDriver
                 // where it has one.
                 if ($appCallback !== null) {
                     return (int) $appCallback($ch, $line);
+                }
+
+                // No callback, but a destination they set with
+                // CURLOPT_WRITEHEADER. Our callback has taken that destination
+                // over, so we have to honour it ourselves or their file stays
+                // empty.
+                if ($appStream !== null) {
+                    @fwrite($appStream, $line);
                 }
 
                 return strlen($line);

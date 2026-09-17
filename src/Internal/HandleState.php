@@ -121,9 +121,37 @@ final class HandleState
      */
     private function isOn(int $option): bool
     {
-        $value = $this->options[$option] ?? false;
+        return self::curlBool($this->options[$option] ?? false);
+    }
 
-        return $value === true || $value === 1 || $value === '1';
+    /**
+     * Whether curl would treat this value as on.
+     *
+     * PHP converts the value for a boolean curl option with its ordinary
+     * integer cast and libcurl treats any non-zero as on, so `2`, `'2'` and
+     * `1.0` all enable an option while `'yes'` does not. Verified against
+     * ext-curl for CURLOPT_HEADER and CURLOPT_VERBOSE rather than assumed.
+     *
+     * Recognising only true, 1 and '1' meant `CURLOPT_HEADER => 2` looked off:
+     * with RETURNTRANSFER the response headers were then recorded as body
+     * text, where header redaction never looks, and an intermediate redirect's
+     * Set-Cookie survived into the record.
+     */
+    public static function curlBool(mixed $value): bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+
+        if (is_int($value) || is_float($value)) {
+            return (int) $value !== 0;
+        }
+
+        if (is_string($value)) {
+            return (int) $value !== 0;
+        }
+
+        return false;
     }
 
     /**
@@ -227,12 +255,16 @@ final class HandleState
      */
     public function canUseHeaderOut(): bool
     {
-        return ($this->options[CURLOPT_VERBOSE] ?? false) !== true;
+        // `CURLOPT_VERBOSE => 1` is the form most code uses. A strict !== true
+        // check read it as off, so wiretap installed CURLINFO_HEADER_OUT into
+        // the same libcurl debug slot and the application's verbose output
+        // silently stopped — diagnostics it had explicitly asked for.
+        return !$this->isOn(CURLOPT_VERBOSE);
     }
 
     public function returnsTransfer(): bool
     {
-        return ($this->options[CURLOPT_RETURNTRANSFER] ?? false) === true;
+        return $this->isOn(CURLOPT_RETURNTRANSFER);
     }
 
     public function isStreamingToCallback(): bool
@@ -244,6 +276,31 @@ final class HandleState
     public function appHeaderFunction(): ?callable
     {
         return $this->appHeaderFunction;
+    }
+
+    /**
+     * The stream curl would write response headers to.
+     *
+     * An application can route headers to a file without ever setting a
+     * callback, using CURLOPT_WRITEHEADER alone. Installing our own
+     * HEADERFUNCTION takes that destination over, and the file it was writing
+     * to stayed empty — instrumentation changing what the application does,
+     * which is the one thing this package must never do. The wrapper writes
+     * the bytes there itself instead.
+     *
+     * @return resource|null
+     */
+    public function appHeaderStream()
+    {
+        if ($this->appHeaderFunction !== null) {
+            // A callback wins over WRITEHEADER in curl, so there is no
+            // destination for us to stand in for.
+            return null;
+        }
+
+        $stream = $this->options[CURLOPT_WRITEHEADER] ?? null;
+
+        return is_resource($stream) ? $stream : null;
     }
 
     public function appendResponseHeader(string $line): void
