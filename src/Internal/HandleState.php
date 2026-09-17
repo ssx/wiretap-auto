@@ -26,6 +26,11 @@ final class HandleState
 
     private bool $headersInstalled = false;
 
+    /**
+     * Set when the shadow state is known to disagree with the handle.
+     */
+    private ?string $unsafeReason = null;
+
     /** @var callable|null */
     private $appHeaderFunction = null;
 
@@ -49,11 +54,20 @@ final class HandleState
         // curl treats these as mutually exclusive method switches. Tracking
         // only the last-set option reported POST with a stale body after the
         // caller switched back to GET.
-        if ($option === CURLOPT_HTTPGET && $value) {
-            unset($this->options[CURLOPT_POST], $this->options[CURLOPT_POSTFIELDS], $this->options[CURLOPT_PUT]);
+        if ($option === CURLOPT_HTTPGET && self::curlBool($value)) {
+            // NOBODY too. CURLOPT_HTTPGET clears it in curl, so a handle
+            // switched from HEAD back to GET was sending GET while the record
+            // said HEAD — and a HEAD record carries no response body, so the
+            // body of that GET was reported as absent rather than captured.
+            unset(
+                $this->options[CURLOPT_POST],
+                $this->options[CURLOPT_POSTFIELDS],
+                $this->options[CURLOPT_PUT],
+                $this->options[CURLOPT_NOBODY],
+            );
         }
 
-        if ($option === CURLOPT_POST && $value) {
+        if ($option === CURLOPT_POST && self::curlBool($value)) {
             unset($this->options[CURLOPT_HTTPGET], $this->options[CURLOPT_NOBODY]);
         }
     }
@@ -173,6 +187,16 @@ final class HandleState
         $fields = $this->options[CURLOPT_POSTFIELDS] ?? null;
 
         if (is_array($fields)) {
+            return 'application/x-www-form-urlencoded';
+        }
+
+        // A string POSTFIELDS with no explicit header is what curl sends as
+        // application/x-www-form-urlencoded. Reporting null made the redactor
+        // try to parse it as JSON, and with bodyPaths configured that failed
+        // to inspect the body and dropped the whole thing — so a form post
+        // that could have been recorded with one field redacted was recorded
+        // as nothing at all.
+        if (is_string($fields)) {
             return 'application/x-www-form-urlencoded';
         }
 
@@ -366,5 +390,35 @@ final class HandleState
         $this->responseHeaderBuffer = '';
         $this->capturing = false;
         $this->headersInstalled = false;
+        // curl_reset puts the handle back to defaults, which is the one thing
+        // that can make a divergent shadow state agree again.
+        $this->unsafeReason = null;
+    }
+
+    /**
+     * Record that we no longer know what this handle is configured to do.
+     *
+     * curl exposes no way to read an option back, so the shadow state is the
+     * only model we have. A curl_setopt_array() that fails part way through
+     * applies some of its options and rejects the rest, and we cannot tell
+     * which — so every capture decision taken from it is a guess. Guessing
+     * wrong about CURLOPT_HEADER in particular writes the response headers
+     * into the recorded body, where header redaction never looks.
+     *
+     * Capture is declined until curl_reset() re-establishes a known state.
+     */
+    public function markUnsafe(string $reason): void
+    {
+        $this->unsafeReason = $reason;
+    }
+
+    public function isUnsafe(): bool
+    {
+        return $this->unsafeReason !== null;
+    }
+
+    public function unsafeReason(): ?string
+    {
+        return $this->unsafeReason;
     }
 }

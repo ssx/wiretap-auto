@@ -113,8 +113,23 @@ final class OtelHookDriver implements HookDriver
 
     private function hookSetopt(): void
     {
-        $this->hook('curl_setopt', pre: function (mixed $obj, array $params): void {
+        // Both record in post, not pre.
+        //
+        // Recording before curl had accepted the value meant a rejected option
+        // still changed the shadow state. With CURLOPT_HEADER on, a
+        // curl_setopt_array() carrying an invalid CURLOPT_HTTPHEADER plus
+        // CURLOPT_HEADER => false failed before curl ever disabled headers —
+        // but wiretap already believed they were off, so if the application
+        // caught the failure and executed anyway, the response headers were
+        // recorded as body text with no header redaction applied to them.
+        $this->hook('curl_setopt', post: function (mixed $obj, array $params, mixed $result, ?\Throwable $exception = null): void {
             if ($this->applyingOptions || !($params[0] ?? null) instanceof \CurlHandle) {
+                return;
+            }
+
+            // curl rejected it, so the handle is unchanged and so is our model
+            // of it. Nothing to record, and nothing has diverged.
+            if ($exception !== null || $result === false) {
                 return;
             }
 
@@ -127,16 +142,31 @@ final class OtelHookDriver implements HookDriver
             }
         });
 
-        $this->hook('curl_setopt_array', pre: function (mixed $obj, array $params): void {
+        $this->hook('curl_setopt_array', post: function (mixed $obj, array $params, mixed $result, ?\Throwable $exception = null): void {
             if ($this->applyingOptions || !($params[0] ?? null) instanceof \CurlHandle) {
                 return;
             }
 
-            if (isset($params[1]) && is_array($params[1])) {
-                /** @var array<int, mixed> $options */
-                $options = $params[1];
-                $this->registry->for($params[0])->setMany($options);
+            if (!isset($params[1]) || !is_array($params[1])) {
+                return;
             }
+
+            /** @var array<int, mixed> $options */
+            $options = $params[1];
+
+            if ($exception === null && $result !== false) {
+                $this->registry->for($params[0])->setMany($options);
+
+                return;
+            }
+
+            // It stopped at the first option curl refused, having already
+            // applied the ones before it. There is no way to ask curl which
+            // those were, so the shadow state is no longer a model of this
+            // handle and every capture decision from it would be a guess.
+            $this->registry->for($params[0])->markUnsafe(
+                'curl_setopt_array() failed part way through; the applied options are unknown',
+            );
         });
     }
 
@@ -176,7 +206,14 @@ final class OtelHookDriver implements HookDriver
 
                 // The gate runs before the transfer, so a blocked payload is
                 // never even asked for.
-                $capture = $url !== null && $this->recorder()->shouldCapture($url);
+                //
+                // A handle whose options we can no longer model is declined
+                // outright: a record built on a guess about CURLOPT_HEADER can
+                // put unredacted response headers in the body, and no record
+                // is better than a wrong one.
+                $capture = $url !== null
+                    && !$state->isUnsafe()
+                    && $this->recorder()->shouldCapture($url);
                 $state->beginTransfer($capture);
 
                 if ($capture) {
