@@ -8,6 +8,7 @@ use Ssx\Wiretap\Blocklist\ArrayBlocklistProvider;
 use Ssx\Wiretap\Blocklist\Blocklist;
 use Ssx\Wiretap\Recorder;
 use Ssx\Wiretap\Sink\InMemorySink;
+use Ssx\Wiretap\Wiretap as Core;
 
 /**
  * These exercise the real hooks against a real local server.
@@ -176,4 +177,31 @@ it('tracks options set on a copied handle independently', function (): void {
     expect($uris)->toHaveCount(2)
         ->and(implode(' ', $uris))->toContain('/echo')
         ->and(implode(' ', $uris))->toContain('/other');
+});
+
+it('writes to a recorder set on the core holder, not a second one of its own', function (): void {
+    // Two global holders would mean a framework can wire up a properly
+    // configured recorder, set it on one, and have the live hooks go on
+    // writing to the other. There must be exactly one.
+    $sink = new InMemorySink();
+    Core::setRecorder(new Recorder(sink: $sink, blocklist: new Blocklist()));
+
+    $ch = curl_init('http://127.0.0.1:' . TEST_SERVER_PORT . '/echo');
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_exec($ch);
+    curl_close($ch);
+
+    Core::recorder()->flush();
+
+    expect($sink->all())->toHaveCount(1)
+        ->and(Wiretap::recorder())->toBe(Core::recorder());
+});
+
+it('exposes the same recorder through either facade', function (): void {
+    $recorder = new Recorder(sink: new InMemorySink());
+
+    Wiretap::setRecorder($recorder);
+
+    expect(Core::recorder())->toBe($recorder)
+        ->and(Wiretap::recorder())->toBe($recorder);
 });
