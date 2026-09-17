@@ -88,7 +88,10 @@ final class HandleState
     public function method(): string
     {
         if (isset($this->options[CURLOPT_CUSTOMREQUEST]) && is_string($this->options[CURLOPT_CUSTOMREQUEST])) {
-            return strtoupper($this->options[CURLOPT_CUSTOMREQUEST]);
+            // Exactly as given. curl sends a custom method verbatim, and
+            // upper-casing it meant the record disagreed with the request —
+            // WebDAV and several vendor APIs use mixed-case verbs.
+            return $this->options[CURLOPT_CUSTOMREQUEST];
         }
 
         // curl accepts 1 as well as true. A strict === true check reported
