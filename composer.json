@@ -23,9 +23,10 @@
         "ssx/wiretap": "~0.0.5 || dev-main"
     },
     "require-dev": {
+        "guzzlehttp/guzzle": "^7.5",
         "pestphp/pest": "^2.34",
         "phpstan/phpstan": "^1.11",
-        "guzzlehttp/guzzle": "^7.5"
+        "symfony/http-client": "^7.4"
     },
     "suggest": {
         "ext-opentelemetry": "Required for capture. Without it this package is inert."

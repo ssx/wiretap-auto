@@ -24,39 +24,56 @@ $body = curl_exec($ch);
 $response = (new GuzzleHttp\Client())->get('https://api.example.com/v1');
 ```
 
-## ⚠️ Synchronous transfers only
+## What is captured
 
-**This package hooks `curl_exec`. It does not hook `curl_multi_*`, so anything
-using the multi interface is not captured.**
+Both halves of ext-curl are hooked: `curl_exec` and the `curl_multi_*`
+interface.
 
 | | Captured by this package |
 | --- | --- |
 | `curl_exec()` anywhere, including vendor code | yes |
 | Guzzle, synchronous (`$client->get()`) | yes |
-| Guzzle, async (`getAsync()`, `Pool`, `requestAsync`) | **no** |
-| Symfony HttpClient (`CurlHttpClient`) | **no** |
+| Guzzle, async (`getAsync()`, `Pool`, `requestAsync`) | yes |
+| Symfony HttpClient (`CurlHttpClient`) | yes |
+| Raw `curl_multi_*` loops | yes |
 
-Guzzle's default handler is `Proxy::wrapSync(CurlMultiHandler, CurlHandler)` —
-only the synchronous branch reaches `curl_exec`. Symfony's `CurlHttpClient` is
-multi-only and never calls it at all.
+The multi interface matters more than it sounds. Guzzle's default handler is
+`Proxy::wrapSync(CurlMultiHandler, CurlHandler)`, so every async request, every
+`Pool` and every concurrent batch goes through `curl_multi_*` and never touches
+`curl_exec`. Symfony's `CurlHttpClient` is multi-only and never calls it at all.
+Vendor code making async calls is precisely what this package exists to see.
 
-Measured, not assumed:
+Measured, not assumed — one script doing a sync GET, an async GET, a two-request
+pool and a raw multi loop:
 
 ```
-sync  : 1 recorded
-async : 0 recorded (getAsync->wait)
-pool  : 0 recorded (2 concurrent)
+before   recorded 1:
+           /sync     status=200
+
+after    recorded 5:
+           /async    status=200
+           /multi-1  status=200 bytes=8
+           /pool-1   status=200
+           /pool-2   status=200
+           /sync     status=200
 ```
 
-If you own the client, the bridge packages cover async properly —
-[`ssx/wiretap-guzzle`](https://github.com/ssx/wiretap-guzzle) captures sync,
-async and pools; [`ssx/wiretap-symfony`](https://github.com/ssx/wiretap-symfony)
-decorates Symfony's client.
+A transfer is set up when it enters the multi stack and recorded when the
+application learns it finished — either `curl_multi_info_read()`, which is what
+Guzzle's handler uses, or `curl_multi_remove_handle()` for code that never asks.
+Both are hooked and recording happens once per transfer either way.
 
-The gap that remains is **vendor code you cannot edit, making async calls**.
-That is precisely what this package exists for, so the limitation is a real
-one and not a footnote. Hooking the multi interface is planned; until then,
-`wiretap doctor` reports it.
+### Response bodies
+
+Guzzle configures `CURLOPT_WRITEFUNCTION` to stream responses, so there is no
+returned string for wiretap to read and those records carry
+`omitted_reason: streaming` rather than a body. That is true of Guzzle's
+synchronous path too and is not specific to async. Code using
+`CURLOPT_RETURNTRANSFER`, including raw multi loops, records the body normally.
+
+If you own the client, the bridge packages capture bodies in every case —
+[`ssx/wiretap-guzzle`](https://github.com/ssx/wiretap-guzzle) and
+[`ssx/wiretap-symfony`](https://github.com/ssx/wiretap-symfony).
 
 ## How it works
 

@@ -426,6 +426,20 @@ final class HandleState
         return $this->capturing;
     }
 
+    /**
+     * Mark the transfer as recorded.
+     *
+     * A multi transfer can be reported complete twice — once by
+     * curl_multi_info_read and again by curl_multi_remove_handle — and an
+     * application is free to call either, both or neither. Clearing the flag
+     * here is what makes recording happen exactly once per transfer however
+     * the application drives the loop.
+     */
+    public function endTransfer(): void
+    {
+        $this->capturing = false;
+    }
+
     public function startedAt(): float
     {
         return $this->startedAt;
