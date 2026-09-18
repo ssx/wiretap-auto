@@ -62,7 +62,7 @@ final readonly class ExchangeFactory
             requestBody: $this->requestBody($state),
             status: $this->status($info),
             reason: null,
-            responseHeaders: Headers::fromRaw($this->lastResponseHeaderBlock($state->responseHeaders())),
+            responseHeaders: Headers::fromRaw($state->finalResponseHeaderBlock()),
             responseBody: $this->responseBody($state, $result),
             timings: Timings::fromCurlInfo($info),
             error: $errno !== 0
@@ -169,8 +169,19 @@ final readonly class ExchangeFactory
             );
         }
 
-        $contentType = Headers::fromRaw($this->lastResponseHeaderBlock($state->responseHeaders()))
-            ->first('Content-Type');
+        $contentType = Headers::fromRaw($state->finalResponseHeaderBlock())->first('Content-Type');
+
+        // A missing Content-Type normally means the server sent none, and core
+        // captures the body on the assumption it is text. That assumption does
+        // not hold when we know headers were dropped for size: the type may
+        // have been among them, and guessing wrong stores a binary payload the
+        // content-type gate exists to keep out.
+        if ($contentType === null && $state->headersTruncated()) {
+            return CapturedBody::omitted(
+                CapturedBody::OMITTED_NOT_READABLE,
+                strlen($result),
+            );
+        }
 
         $size = strlen($result);
 
@@ -187,22 +198,5 @@ final readonly class ExchangeFactory
         return CapturedBody::captured($result, $size, $contentType);
     }
 
-    /**
-     * A redirect chain produces several header blocks separated by a blank
-     * line. The last one describes the response the caller actually received.
-     */
-    private function lastResponseHeaderBlock(string $raw): string
-    {
-        $raw = trim($raw);
-
-        if ($raw === '') {
-            return '';
-        }
-
-        $blocks = preg_split("/(\r\n){2,}|\n{2,}/", $raw) ?: [$raw];
-        $blocks = array_values(array_filter($blocks, static fn (string $b): bool => trim($b) !== ''));
-
-        return $blocks === [] ? '' : (string) end($blocks);
-    }
 
 }
