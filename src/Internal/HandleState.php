@@ -18,7 +18,18 @@ final class HandleState
     /** @var array<int, mixed> */
     private array $options = [];
 
+    /**
+     * Completed header blocks from earlier hops in a redirect chain.
+     */
     private string $responseHeaderBuffer = '';
+
+    /**
+     * The block for the response currently arriving, kept separately so a
+     * long redirect chain cannot starve it.
+     */
+    private string $currentHeaderBlock = '';
+
+    private bool $headersTruncated = false;
 
     private float $startedAt = 0.0;
 
@@ -30,6 +41,10 @@ final class HandleState
      * Set when the shadow state is known to disagree with the handle.
      */
     private ?string $unsafeReason = null;
+
+    private const MAX_HEADER_BLOCK_BYTES = 65536;
+
+    private const MAX_HEADER_CHAIN_BYTES = 262144;
 
     /** @var callable|null */
     private $appHeaderFunction = null;
@@ -329,15 +344,72 @@ final class HandleState
 
     public function appendResponseHeader(string $line): void
     {
-        // Bounded, so a misbehaving server cannot grow this without limit.
-        if (strlen($this->responseHeaderBuffer) < 65536) {
-            $this->responseHeaderBuffer .= $line;
+        // A status line starts a new response. Blocks were previously split on
+        // blank lines, which made HTTP trailers look like a fresh response:
+        // a chunked application/octet-stream followed by a trailer block left
+        // the trailer as the recorded headers, the real Content-Type was lost,
+        // and core then treated the binary body as capturable and stored it.
+        if (self::isStatusLine($line) && $this->currentHeaderBlock !== '') {
+            $this->archiveCurrentBlock();
         }
+
+        // The current response's block is bounded on its own.
+        //
+        // One shared 64 KiB buffer meant a long redirect chain could exhaust
+        // it before the final response even started, so its Content-Type was
+        // discarded, the factory reported none, and the redactor kept a body
+        // it would otherwise have dropped. The block that decides that is now
+        // always the one with room.
+        if (strlen($this->currentHeaderBlock) < self::MAX_HEADER_BLOCK_BYTES) {
+            $this->currentHeaderBlock .= $line;
+
+            return;
+        }
+
+        $this->headersTruncated = true;
     }
 
+    private function archiveCurrentBlock(): void
+    {
+        if (strlen($this->responseHeaderBuffer) + strlen($this->currentHeaderBlock) <= self::MAX_HEADER_CHAIN_BYTES) {
+            $this->responseHeaderBuffer .= $this->currentHeaderBlock;
+        } else {
+            // Earlier hops are what gets dropped, never the response the
+            // caller actually received.
+            $this->headersTruncated = true;
+        }
+
+        $this->currentHeaderBlock = '';
+    }
+
+    private static function isStatusLine(string $line): bool
+    {
+        return preg_match('#^HTTP/\d#i', $line) === 1;
+    }
+
+    /**
+     * Every header block observed, including redirect hops.
+     */
     public function responseHeaders(): string
     {
-        return $this->responseHeaderBuffer;
+        return $this->responseHeaderBuffer . $this->currentHeaderBlock;
+    }
+
+    /**
+     * The headers of the response the caller actually received.
+     */
+    public function finalResponseHeaderBlock(): string
+    {
+        return $this->currentHeaderBlock;
+    }
+
+    /**
+     * Whether anything was dropped for size. A missing Content-Type cannot be
+     * trusted to mean the server did not send one when this is true.
+     */
+    public function headersTruncated(): bool
+    {
+        return $this->headersTruncated;
     }
 
     public function beginTransfer(bool $capturing): void
@@ -345,6 +417,8 @@ final class HandleState
         $this->capturing = $capturing;
         $this->startedAt = microtime(true);
         $this->responseHeaderBuffer = '';
+        $this->currentHeaderBlock = '';
+        $this->headersTruncated = false;
     }
 
     public function isCapturing(): bool
@@ -388,6 +462,8 @@ final class HandleState
         $this->options = [];
         $this->appHeaderFunction = null;
         $this->responseHeaderBuffer = '';
+        $this->currentHeaderBlock = '';
+        $this->headersTruncated = false;
         $this->capturing = false;
         $this->headersInstalled = false;
         // curl_reset puts the handle back to defaults, which is the one thing

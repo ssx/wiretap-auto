@@ -36,12 +36,42 @@ final class HandleRegistry
 
     public function for(object $handle): HandleState
     {
-        if (!$this->handles->offsetExists($handle)) {
-            $this->enforceCapacity();
-            $this->handles[$handle] = new HandleState();
+        if ($this->handles->offsetExists($handle)) {
+            return $this->handles[$handle];
         }
 
+        if (count($this->handles) >= $this->maxHandles) {
+            return $this->untracked();
+        }
+
+        $this->handles[$handle] = new HandleState();
+
         return $this->handles[$handle];
+    }
+
+    /**
+     * A throwaway state for a handle we have declined to track.
+     *
+     * At capacity the registry used to clear itself, which discarded the state
+     * of handles that were still live and still instrumented. Their recorded
+     * CURLOPT_HEADERFUNCTION went with it, so the next capture on one of those
+     * handles installed a fresh wrapper with nothing to chain onto and the
+     * application's own header callback stopped being called — instrumentation
+     * silently removing application behaviour.
+     *
+     * Declining the new handle instead costs capture for that handle only, and
+     * costs nothing that was already working. The state is marked unsafe so
+     * the exec hook declines capture and never installs a wrapper on it, and
+     * it is not stored, so nothing accumulates. Entries for handles the
+     * application has finished with drop out of the WeakMap on their own,
+     * which is how capacity comes back.
+     */
+    private function untracked(): HandleState
+    {
+        $state = new HandleState();
+        $state->markUnsafe('handle registry is at capacity; this handle is not tracked');
+
+        return $state;
     }
 
     public function has(object $handle): bool
@@ -59,8 +89,11 @@ final class HandleRegistry
         // can clear the map, and the source would no longer be in it.
         $copied = $this->handles[$from]->copy();
 
-        // Copies go through the same capacity check as any other insertion.
-        $this->enforceCapacity();
+        // Copies go through the same capacity check as any other insertion,
+        // and are declined the same way rather than evicting anyone.
+        if (!$this->handles->offsetExists($to) && count($this->handles) >= $this->maxHandles) {
+            return;
+        }
 
         $this->handles[$to] = $copied;
     }
@@ -84,15 +117,4 @@ final class HandleRegistry
         $this->handles = $map;
     }
 
-    /**
-     * Something is holding far more handles than any application needs.
-     * Dropping the shadow state costs capture for in-flight transfers, which
-     * beats unbounded growth inside instrumentation.
-     */
-    private function enforceCapacity(): void
-    {
-        if (count($this->handles) >= $this->maxHandles) {
-            $this->clear();
-        }
-    }
 }
