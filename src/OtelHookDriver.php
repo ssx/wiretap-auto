@@ -93,6 +93,7 @@ final class OtelHookDriver implements HookDriver
         $this->hookSetopt();
         $this->hookLifecycle();
         $this->hookExec();
+        $this->hookMulti();
     }
 
     private function hookInit(): void
@@ -200,25 +201,7 @@ final class OtelHookDriver implements HookDriver
                     return;
                 }
 
-                $handle = $params[0];
-                $state = $this->registry->for($handle);
-                $url = $state->url();
-
-                // The gate runs before the transfer, so a blocked payload is
-                // never even asked for.
-                //
-                // A handle whose options we can no longer model is declined
-                // outright: a record built on a guess about CURLOPT_HEADER can
-                // put unredacted response headers in the body, and no record
-                // is better than a wrong one.
-                $capture = $url !== null
-                    && !$state->isUnsafe()
-                    && $this->recorder()->shouldCapture($url);
-                $state->beginTransfer($capture);
-
-                if ($capture) {
-                    $this->installCaptureOptions($handle, $state);
-                }
+                $this->beginTransfer($params[0]);
             },
             post: function (mixed $obj, array $params, mixed $result): void {
                 if (!($params[0] ?? null) instanceof \CurlHandle) {
@@ -231,24 +214,146 @@ final class OtelHookDriver implements HookDriver
                     return;
                 }
 
-                $state = $this->registry->for($handle);
-
-                if (!$state->isCapturing()) {
-                    return;
-                }
-
-                $info = curl_getinfo($handle);
-                $errno = curl_errno($handle);
-
-                $this->recorder()->record($this->factory->create(
-                    state: $state,
-                    info: is_array($info) ? $info : [],
-                    result: $result,
-                    errno: $errno,
-                    error: $errno !== 0 ? curl_error($handle) : '',
-                ));
+                $this->finishTransfer($handle, $result);
             },
         );
+    }
+
+    /**
+     * Decide whether to capture this transfer and prepare the handle.
+     *
+     * Shared by curl_exec and curl_multi_add_handle: the decision and the
+     * options needed to honour it are identical, and only the moment differs.
+     */
+    private function beginTransfer(mixed $handle): void
+    {
+        if (!$handle instanceof \CurlHandle) {
+            return;
+        }
+
+        $state = $this->registry->for($handle);
+        $url = $state->url();
+
+        // The gate runs before the transfer, so a blocked payload is never
+        // even asked for.
+        //
+        // A handle whose options we can no longer model is declined outright:
+        // a record built on a guess about CURLOPT_HEADER can put unredacted
+        // response headers in the body, and no record is better than a wrong
+        // one.
+        $capture = $url !== null
+            && !$state->isUnsafe()
+            && $this->recorder()->shouldCapture($url);
+
+        $state->beginTransfer($capture);
+
+        if ($capture) {
+            $this->installCaptureOptions($handle, $state);
+        }
+    }
+
+    /**
+     * Record a finished transfer, if it was one we were capturing.
+     */
+    private function finishTransfer(mixed $handle, mixed $result): void
+    {
+        if (!$handle instanceof \CurlHandle || !$this->registry->has($handle)) {
+            return;
+        }
+
+        $state = $this->registry->for($handle);
+
+        if (!$state->isCapturing()) {
+            return;
+        }
+
+        // Once, however the transfer ends. A multi handle can reach both
+        // curl_multi_info_read and curl_multi_remove_handle, and an
+        // application is free to call neither, one, or both.
+        $state->endTransfer();
+
+        $info = curl_getinfo($handle);
+        $errno = curl_errno($handle);
+
+        $this->recorder()->record($this->factory->create(
+            state: $state,
+            info: is_array($info) ? $info : [],
+            result: $result,
+            errno: $errno,
+            error: $errno !== 0 ? curl_error($handle) : '',
+        ));
+    }
+
+    /**
+     * The multi interface.
+     *
+     * curl_exec is only half of ext-curl. Guzzle's default handler is
+     * Proxy::wrapSync(CurlMultiHandler, CurlHandler), so every async request,
+     * every Pool and every concurrent batch goes through curl_multi_* and
+     * never touches curl_exec — and Symfony's CurlHttpClient is multi-only, so
+     * none of its traffic did either. Vendor code making async calls is
+     * precisely what this package exists to see, so this was the gap that
+     * mattered most.
+     *
+     * The shape is the same as the synchronous path, just spread out in time:
+     * add_handle is where curl_exec's pre would have run, and completion is
+     * reported by info_read or by remove_handle, whichever the application
+     * uses. Both are hooked, and finishTransfer() is idempotent per transfer.
+     */
+    private function hookMulti(): void
+    {
+        $this->hook('curl_multi_add_handle', post: function (mixed $obj, array $params, mixed $result): void {
+            // Only when curl accepted the handle into the multi stack.
+            if ($result !== 0) {
+                return;
+            }
+
+            $this->beginTransfer($params[1] ?? null);
+        });
+
+        // The application asking which transfers finished is the earliest
+        // reliable completion signal, and the one Guzzle's CurlMultiHandler
+        // uses. curl_getinfo is still valid at this point.
+        $this->hook('curl_multi_info_read', post: function (mixed $obj, array $params, mixed $result): void {
+            if (!is_array($result) || ($result['msg'] ?? null) !== CURLMSG_DONE) {
+                return;
+            }
+
+            $handle = $result['handle'] ?? null;
+
+            if (!$handle instanceof \CurlHandle) {
+                return;
+            }
+
+            $this->finishTransfer($handle, $this->multiContent($handle));
+        });
+
+        // The backstop, for an application that never calls info_read. Runs
+        // before the handle leaves the stack, while its info is still readable.
+        $this->hook('curl_multi_remove_handle', pre: function (mixed $obj, array $params): void {
+            $handle = $params[1] ?? null;
+
+            if (!$handle instanceof \CurlHandle) {
+                return;
+            }
+
+            $this->finishTransfer($handle, $this->multiContent($handle));
+        });
+    }
+
+    /**
+     * The response body of a multi transfer.
+     *
+     * curl_multi_getcontent returns it only when the handle was configured
+     * with RETURNTRANSFER; otherwise the body went straight to output or to a
+     * file and there is nothing for us to read, which the factory already
+     * records as an omission rather than an empty body.
+     */
+    private function multiContent(\CurlHandle $handle): mixed
+    {
+        $content = curl_multi_getcontent($handle);
+
+        return $content ?? false;
     }
 
     /**
