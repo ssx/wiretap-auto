@@ -15,8 +15,8 @@ use Ssx\Wiretap\TransferError;
 /**
  * Assembles an Exchange from the five sources a curl transfer exposes.
  *
- *   request headers   the shadowed HTTPHEADER lines, or CURLINFO_HEADER_OUT
- *                     when the application turned it on itself
+ *   request headers   what curl sent, where it told us, otherwise rebuilt
+ *                     from the shadowed options (see RequestHeaders)
  *   request body      the shadowed CURLOPT_POSTFIELDS
  *   response headers  our chained CURLOPT_HEADERFUNCTION
  *   response body     the curl_exec() return value
@@ -53,6 +53,7 @@ final readonly class ExchangeFactory
     ): Exchange {
         $effectiveUrl = is_string($info['url'] ?? null) ? $info['url'] : ($state->url() ?? '');
         $sent = $this->sentRequestHeaders($info);
+        $redirects = is_int($info['redirect_count'] ?? null) ? $info['redirect_count'] : 0;
 
         return new Exchange(
             id: Ulid::generate($state->startedAt() ?: null),
@@ -60,7 +61,7 @@ final readonly class ExchangeFactory
             transport: Exchange::TRANSPORT_CURL,
             method: $state->method(),
             uri: $effectiveUrl,
-            requestHeaders: $sent ?? Headers::fromRaw(implode("\r\n", $state->requestHeaderLines())),
+            requestHeaders: $sent ?? Headers::fromRaw(implode("\r\n", RequestHeaders::reconstruct($state, $effectiveUrl, $redirects))),
             requestBody: $this->requestBody($state),
             status: $this->status($info),
             reason: null,
@@ -73,10 +74,10 @@ final readonly class ExchangeFactory
             startedAt: $state->startedAt(),
             sequence: Correlation::nextSequence(),
             pid: getmypid() ?: null,
-            // The configured headers are not every header sent: libcurl adds
-            // Host, Accept and others of its own. A record that presented
-            // them as the full set would be claiming more than it knows.
-            context: $sent === null ? ['request_headers' => 'configured'] : [],
+            // Says which it is. A rebuilt set leaves out whatever the options
+            // do not determine (Digest, a multipart boundary, curl's cookie
+            // jar), so it must not pass for the bytes on the wire.
+            context: ['request_headers' => $sent === null ? 'reconstructed' : 'sent'],
         );
     }
 

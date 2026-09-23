@@ -75,6 +75,22 @@ final class HandleState
         // is lost by not keeping the object itself.
         $this->options[$option] = self::shadowValue($value);
 
+        // CURLOPT_USERPWD sets both halves; CURLOPT_USERNAME and
+        // CURLOPT_PASSWORD each set one, and whichever came last wins. Kept
+        // as the two halves so the rebuilt Authorization follows the same
+        // order curl does.
+        if ($option === CURLOPT_USERPWD) {
+            unset($this->options[CURLOPT_USERPWD]);
+
+            if (is_string($value)) {
+                [$user, $password] = explode(':', $value, 2) + [1 => ''];
+                $this->options[CURLOPT_USERNAME] = $user;
+                $this->options[CURLOPT_PASSWORD] = $password;
+            } else {
+                unset($this->options[CURLOPT_USERNAME], $this->options[CURLOPT_PASSWORD]);
+            }
+        }
+
         // ext-curl sends a Stringable header as its string. We cannot read it
         // without calling application code, and a header list recorded
         // without it is not what was sent — dropping Content-Type made a

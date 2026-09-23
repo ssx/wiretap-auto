@@ -21,6 +21,20 @@ file_put_contents($docroot . '/index.php', <<<'ROUTER'
 <?php
 // A redirect, and an endpoint that fails every other call, for exercising
 // the hops a client makes on its own.
+if (str_starts_with($_SERVER['REQUEST_URI'], '/xredirect')) {
+    header('Location: http://localhost:' . $_SERVER['SERVER_PORT'] . '/echo?from=x', true, 302);
+    exit;
+}
+if (str_starts_with($_SERVER['REQUEST_URI'], '/setcookie')) {
+    setcookie('jar', 'v');
+    header('Location: /echo', true, 302);
+    exit;
+}
+if (str_starts_with($_SERVER['REQUEST_URI'], '/headers')) {
+    header('Content-Type: application/json');
+    echo json_encode(getallheaders());
+    exit;
+}
 if (str_starts_with($_SERVER['REQUEST_URI'], '/redirect')) {
     header('Location: /echo?from=redirect', true, 302);
     exit;
@@ -61,8 +75,13 @@ for ($i = 0; $i < 50; ++$i) {
     usleep(100_000);
 }
 
-register_shutdown_function(static function () use ($server): void {
-    if (is_resource($server)) {
+// Only in the process that started it. MultiInterfaceTest forks a helper
+// server, and that child inherits this function: when it exited it used to
+// stop the shared server for every test still to run.
+$owner = getmypid();
+
+register_shutdown_function(static function () use ($server, $owner): void {
+    if (is_resource($server) && getmypid() === $owner) {
         proc_terminate($server);
         proc_close($server);
     }

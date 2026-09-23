@@ -113,11 +113,25 @@ request headers it sent, and hands them to anything that calls
 `curl_getinfo()` — Authorization included. Guzzle copies them into handler
 stats and exception context, so they reach logs and error trackers. It also
 shares libcurl's debug slot with `CURLOPT_VERBOSE`, silently blanking verbose
-output ([bug 65348](https://bugs.php.net/bug.php?id=65348)). The record carries
-the headers the application configured instead, with
-`context.request_headers = "configured"`: libcurl's own additions such as
-`Host` are not in it. If the application turned `CURLINFO_HEADER_OUT` on
-itself, the headers actually sent are used.
+output ([bug 65348](https://bugs.php.net/bug.php?id=65348)). Nor does it use
+PHP 8.4's `CURLOPT_DEBUGFUNCTION`, which would see the same bytes: installing
+one makes PHP store them in `curl_getinfo()` all the same, and makes an
+application's own later `CURLINFO_HEADER_OUT` throw.
+
+Instead the record rebuilds the request headers from the handle's options,
+following libcurl's rules and order: `Host`, `Authorization` (Basic from
+`CURLOPT_USERPWD`, `CURLOPT_USERNAME`/`PASSWORD` or the URL, Bearer from
+`CURLOPT_XOAUTH2_BEARER`), `User-Agent`, `Accept`, `Accept-Encoding`,
+`Referer`, `Cookie`, the application's own headers (which replace or, as
+`Name:`, remove curl's), then the body's `Content-Length` and
+`Content-Type`. It is marked `context.request_headers = "reconstructed"`, and
+a record replays as the request the server received. What the options do not
+determine is left out rather than guessed: Digest, NTLM and Negotiate, a
+multipart boundary, `Expect`, cookies from curl's own jar, and body headers
+after a redirect. The rebuilt `Authorization` and `Cookie` go through
+redaction like any other header. If the application turned
+`CURLINFO_HEADER_OUT` on itself, the headers actually sent are used and marked
+`"sent"`.
 
 An application's `CURLOPT_HEADERFUNCTION` is chained, never replaced. If it
 is a private or protected method, which curl accepts from the application's
