@@ -390,7 +390,7 @@ final class OtelHookDriver implements HookDriver
             // a private or protected method is perfectly callable. From ours
             // it is not, and a wrapper that cannot call it would silently
             // stop the application's own callback from running.
-            if (!is_callable($appCallback)) {
+            if (!self::callableFromHere($appCallback)) {
                 return false;
             }
         }
@@ -441,6 +441,41 @@ final class OtelHookDriver implements HookDriver
         } finally {
             $this->applyingOptions = false;
         }
+    }
+
+    /**
+     * Whether calling this from our scope reaches what curl would call.
+     *
+     * is_callable() is not enough on its own. A private method on a class
+     * with a public __call passes it, because from outside the class the
+     * call is routed to __call — which is not the method the application
+     * gave curl, and whose return value aborted the transfer. A method that
+     * exists has to be public for us to call it; one that does not exist
+     * reaches the magic method from the application's scope too.
+     */
+    private static function callableFromHere(mixed $callback): bool
+    {
+        if (!is_callable($callback)) {
+            return false;
+        }
+
+        if (is_string($callback) && str_contains($callback, '::')) {
+            $callback = explode('::', $callback, 2);
+        }
+
+        if (is_array($callback) && (is_object($callback[0]) || is_string($callback[0])) && is_string($callback[1])) {
+            if (!method_exists($callback[0], $callback[1])) {
+                return true;
+            }
+
+            try {
+                return (new \ReflectionMethod($callback[0], $callback[1]))->isPublic();
+            } catch (\ReflectionException) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private function hook(string $function, ?\Closure $pre = null, ?\Closure $post = null): void

@@ -70,6 +70,21 @@ final class HandleState
         // is lost by not keeping the object itself.
         $this->options[$option] = self::shadowValue($value);
 
+        // ext-curl sends a Stringable header as its string. We cannot read it
+        // without calling application code, and a header list recorded
+        // without it is not what was sent — dropping Content-Type made a
+        // JSON body look form-encoded, so bodyPaths redaction missed its
+        // keys. Decline instead of guessing.
+        if ($option === CURLOPT_HTTPHEADER && is_array($value)) {
+            foreach ($value as $header) {
+                if (!is_string($header)) {
+                    $this->markUnsafe('CURLOPT_HTTPHEADER holds a value that is not a string');
+
+                    break;
+                }
+            }
+        }
+
         // Remember the application's own header callback so ours can chain
         // onto it rather than silently replacing it.
         if ($option === CURLOPT_HEADERFUNCTION) {
@@ -348,13 +363,16 @@ final class HandleState
                 continue;
             }
 
-            if (preg_match('/^([^:;\s]+)\s*;\s*$/', $header, $m) === 1) {
+            if (preg_match('/^([^:;\s]+)\s*;$/', $header, $m) === 1) {
                 $lines[] = $m[1] . ':';
 
                 continue;
             }
 
-            if (preg_match('/^[^:]+:\s*$/', $header) === 1) {
+            // A removal, or a line curl does not send at all: no name, or no
+            // colon (`X-C`, `X-E;foo`, `X-A; `). Measured against what curl
+            // reports through CURLINFO_HEADER_OUT.
+            if (preg_match('/^[^:]+:\s*$/', $header) === 1 || preg_match('/^[^:\s]+:/', $header) !== 1) {
                 continue;
             }
 
