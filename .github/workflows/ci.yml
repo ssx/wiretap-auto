@@ -18,6 +18,9 @@ jobs:
       matrix:
         php: ['8.2', '8.3', '8.4']
         otel: ['yes']
+        # Empty means whatever composer resolves; an include below adds 6.4
+        # as a leg of its own rather than replacing the 8.2 one.
+        symfony: ['']
         include:
           # The package must be inert, not broken, when the extension is
           # absent. Integration tests skip themselves; nothing may fatal.
