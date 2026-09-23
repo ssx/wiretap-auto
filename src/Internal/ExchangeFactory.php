@@ -28,6 +28,21 @@ use Ssx\Wiretap\TransferError;
  */
 final readonly class ExchangeFactory
 {
+    /** curl said how the transfer ended: curl_exec returned, or curl_multi_info_read reported it. */
+    public const REPORTED = 'reported';
+
+    /**
+     * Removed from its multi handle after curl_multi_exec() reported nothing
+     * running, but never reported by curl_multi_info_read, so curl's own
+     * result is unknown and the outcome is read from the transfer's info.
+     */
+    public const FINISHED = 'finished';
+
+    /** Removed while curl_multi_exec() still had it running: cancelled. */
+    public const UNFINISHED = 'unfinished';
+
+    public const CANCELLED = 'removed before curl finished it; cancelled';
+
     /**
      * @param int $maxBodyBytes A hard memory ceiling, not the redaction limit.
      *
@@ -43,6 +58,7 @@ final readonly class ExchangeFactory
     /**
      * @param array<string, mixed> $info    curl_getinfo() output
      * @param mixed                $result  the curl_exec() return value
+     * @param string               $completion one of REPORTED, FINISHED, UNFINISHED
      */
     public function create(
         HandleState $state,
@@ -50,14 +66,23 @@ final readonly class ExchangeFactory
         mixed $result,
         int $errno = 0,
         string $error = '',
+        string $completion = self::REPORTED,
     ): Exchange {
+        $transferError = match ($completion) {
+            self::UNFINISHED => new TransferError(-1, self::CANCELLED),
+            self::FINISHED => $this->inferredError($state, $info),
+            default => $errno !== 0
+                ? new TransferError($errno, $error !== '' ? $error : 'curl error ' . $errno)
+                : null,
+        };
+
         $effectiveUrl = is_string($info['url'] ?? null) ? $info['url'] : ($state->url() ?? '');
         $sent = $this->sentRequestHeaders($info);
         $redirects = is_int($info['redirect_count'] ?? null) ? $info['redirect_count'] : 0;
 
         return new Exchange(
             id: Ulid::generate($state->startedAt() ?: null),
-            correlationId: Correlation::id(),
+            correlationId: $state->correlationId() ?? Correlation::id(),
             transport: Exchange::TRANSPORT_CURL,
             method: $state->method(),
             uri: $effectiveUrl,
@@ -66,19 +91,73 @@ final readonly class ExchangeFactory
             status: $this->status($info),
             reason: null,
             responseHeaders: Headers::fromRaw($state->finalResponseHeaderBlock()),
-            responseBody: $this->responseBody($state, $result),
+            // Whatever arrived before a transfer failed or was cancelled is a
+            // prefix at best, and must not pass for the response.
+            responseBody: $completion !== self::REPORTED && $transferError !== null
+                ? CapturedBody::omitted(CapturedBody::OMITTED_NOT_READABLE)
+                : $this->responseBody($state, $result),
             timings: Timings::fromCurlInfo($info),
-            error: $errno !== 0
-                ? new TransferError($errno, $error !== '' ? $error : 'curl error ' . $errno)
-                : null,
+            error: $transferError,
             startedAt: $state->startedAt(),
-            sequence: Correlation::nextSequence(),
+            sequence: $state->sequence() ?? Correlation::nextSequence(),
             pid: getmypid() ?: null,
             // Says which it is. A rebuilt set leaves out whatever the options
             // do not determine (Digest, a multipart boundary, curl's cookie
             // jar), so it must not pass for the bytes on the wire.
-            context: ['request_headers' => $sent === null ? 'reconstructed' : 'sent'],
+            //
+            // transfer_outcome says the outcome was read from the transfer's
+            // info rather than from curl, which reports it only to
+            // curl_multi_info_read.
+            context: ['request_headers' => $sent === null ? 'reconstructed' : 'sent']
+                + ($completion === self::FINISHED ? ['transfer_outcome' => 'inferred'] : []),
         );
+    }
+
+    /**
+     * The outcome of a finished multi transfer curl never reported, from what
+     * its info shows. -1, as for any failure that is not a curl error code:
+     * curl's own code is exactly what is not known.
+     *
+     * Each check is one a success cannot pass. No response at all; a total
+     * time at or past the timeout, which curl enforces while a transfer
+     * runs; fewer bytes than the Content-Length promised. A failure that
+     * leaves none of these traces, such as a chunked body cut short, reads
+     * as a success, which is why the record says the outcome was inferred.
+     *
+     * @param array<string, mixed> $info
+     */
+    private function inferredError(HandleState $state, array $info): ?TransferError
+    {
+        $status = is_int($info['http_code'] ?? null) ? $info['http_code'] : 0;
+
+        if ($status <= 0) {
+            return new TransferError(-1, 'no response (inferred: curl_multi_info_read was not called)');
+        }
+
+        $milliseconds = $state->get(CURLOPT_TIMEOUT_MS);
+        $seconds = $state->get(CURLOPT_TIMEOUT);
+        $limit = is_int($milliseconds) && $milliseconds > 0
+            ? $milliseconds
+            : (is_int($seconds) && $seconds > 0 ? $seconds * 1000 : 0);
+        $elapsed = is_numeric($info['total_time'] ?? null) ? (float) $info['total_time'] * 1000 : 0.0;
+
+        if ($limit > 0 && $elapsed >= $limit) {
+            return new TransferError(-1, sprintf('timed out after %d ms (inferred: curl_multi_info_read was not called)', $limit));
+        }
+
+        $expected = is_numeric($info['download_content_length'] ?? null) ? (float) $info['download_content_length'] : -1.0;
+        $received = is_numeric($info['size_download'] ?? null) ? (float) $info['size_download'] : 0.0;
+        $bodiless = $state->method() === 'HEAD' || $status < 200 || $status === 204 || $status === 304;
+
+        if (!$bodiless && $expected >= 0 && $received < $expected) {
+            return new TransferError(-1, sprintf(
+                'response ended after %d of %d bytes (inferred: curl_multi_info_read was not called)',
+                (int) $received,
+                (int) $expected,
+            ));
+        }
+
+        return null;
     }
 
     /**

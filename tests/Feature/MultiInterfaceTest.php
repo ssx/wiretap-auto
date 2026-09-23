@@ -40,7 +40,27 @@ function multiTestServer(): string
             break;
         }
 
-        fread($connection, 4096);
+        $request = (string) fread($connection, 4096);
+
+        // Answers the status line and the start of the body, then stalls:
+        // a transfer that is still running when the test gives up on it.
+        if (str_starts_with($request, 'GET /slow')) {
+            fwrite($connection, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"partial\":");
+            usleep(1_500_000);
+            @fclose($connection);
+
+            continue;
+        }
+
+        // Promises more than it sends, then closes: curl reports this as a
+        // partial transfer, but only through curl_multi_info_read.
+        if (str_starts_with($request, 'GET /short')) {
+            fwrite($connection, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"partial\":");
+            fclose($connection);
+
+            continue;
+        }
+
         $body = '{"ok":1}';
         fwrite(
             $connection,
@@ -93,6 +113,23 @@ function recordedPaths(array $records): array
     sort($paths);
 
     return $paths;
+}
+
+/**
+ * Run the multi loop until nothing is running or the time is up, without
+ * ever asking curl_multi_info_read how anything ended.
+ */
+function runMultiFor(\CurlMultiHandle $multi, float $seconds): void
+{
+    $until = microtime(true) + $seconds;
+
+    do {
+        curl_multi_exec($multi, $running);
+
+        if ($running) {
+            curl_multi_select($multi, 0.05);
+        }
+    } while ($running && microtime(true) < $until);
 }
 
 function drainMulti(\CurlMultiHandle $multi): void
@@ -205,4 +242,193 @@ it('captures Symfony CurlHttpClient, which never calls curl_exec', function (): 
 
     expect($records)->toHaveCount(1)
         ->and($records[0]['status'])->toBe(200);
+});
+
+/**
+ * curl reports how a multi transfer ended only through curl_multi_info_read,
+ * and many loops never call it: they run curl_multi_exec until nothing is
+ * running and remove their handles, like PHP's manual and plenty of SDKs.
+ * curl_multi_remove_handle() is also how a transfer is cancelled. What
+ * curl_multi_exec() reported decides which one a removal was.
+ */
+describe('a transfer curl_multi_info_read never reported', function (): void {
+    it('is recorded as the success it was when the loop ran to the end', function (): void {
+        $base = multiTestServer();
+
+        $multi = curl_multi_init();
+        $handles = [];
+
+        foreach (['/sdk-1', '/sdk-2'] as $path) {
+            $handle = curl_init("{$base}{$path}");
+            curl_setopt_array($handle, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 10]);
+            curl_multi_add_handle($multi, $handle);
+            $handles[] = $handle;
+        }
+
+        // The shape of the loop in wiretap-examples' ShippingSdk.
+        do {
+            $status = curl_multi_exec($multi, $running);
+
+            if ($running) {
+                curl_multi_select($multi);
+            }
+        } while ($running && $status === CURLM_OK);
+
+        foreach ($handles as $handle) {
+            curl_multi_remove_handle($multi, $handle);
+        }
+
+        $records = recordedIn($this->dir);
+
+        expect($records)->toHaveCount(2);
+
+        foreach ($records as $record) {
+            expect($record['error'] ?? null)->toBeNull()
+                ->and($record['status'])->toBe(200)
+                ->and($record['response']['body']['bytes'])->toBe('{"ok":1}')
+                ->and($record['context']['transfer_outcome'] ?? null)->toBe('inferred');
+        }
+    });
+
+    it('is a failure when cancelled mid-transfer', function (): void {
+        $base = multiTestServer();
+
+        $multi = curl_multi_init();
+        $handle = curl_init("{$base}/slow");
+        curl_setopt($handle, CURLOPT_RETURNTRANSFER, true);
+        curl_multi_add_handle($multi, $handle);
+        runMultiFor($multi, 0.4);
+        curl_multi_remove_handle($multi, $handle);
+
+        $records = recordedIn($this->dir);
+
+        expect($records)->toHaveCount(1)
+            ->and($records[0]['error']['message'] ?? null)->toContain('cancelled')
+            // A partial body is not the response; it must not pass for one.
+            ->and($records[0]['response']['body']['bytes'] ?? null)->toBeNull()
+            ->and($records[0]['response']['body']['omitted_reason'] ?? null)->toBe('not-readable');
+    });
+
+    it('is a failure when it timed out', function (): void {
+        $base = multiTestServer();
+
+        $multi = curl_multi_init();
+        $handle = curl_init("{$base}/slow");
+        curl_setopt_array($handle, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT_MS => 300]);
+        curl_multi_add_handle($multi, $handle);
+        runMultiFor($multi, 3.0);
+
+        // curl gave up on it, but only curl_multi_info_read would have said
+        // so: curl_errno() on the handle is still 0 here.
+        expect(curl_errno($handle))->toBe(0);
+
+        curl_multi_remove_handle($multi, $handle);
+
+        $records = recordedIn($this->dir);
+
+        expect($records)->toHaveCount(1)
+            ->and($records[0]['error']['message'] ?? null)->toContain('timed out')
+            ->and($records[0]['response']['body']['bytes'] ?? null)->toBeNull();
+    });
+
+    it('is a failure when the response ended short of its Content-Length', function (): void {
+        $base = multiTestServer();
+
+        $multi = curl_multi_init();
+        $handle = curl_init("{$base}/short");
+        curl_setopt($handle, CURLOPT_RETURNTRANSFER, true);
+        curl_multi_add_handle($multi, $handle);
+        drainMulti($multi);
+        curl_multi_remove_handle($multi, $handle);
+
+        $records = recordedIn($this->dir);
+
+        expect($records)->toHaveCount(1)
+            ->and($records[0]['error']['message'] ?? null)->toContain('ended after 11 of 100 bytes')
+            ->and($records[0]['response']['body']['bytes'] ?? null)->toBeNull();
+    });
+
+    it('is a failure when nothing answered', function (): void {
+        $multi = curl_multi_init();
+        $handle = curl_init('http://127.0.0.1:1/refused');
+        curl_setopt($handle, CURLOPT_RETURNTRANSFER, true);
+        curl_multi_add_handle($multi, $handle);
+        drainMulti($multi);
+        curl_multi_remove_handle($multi, $handle);
+
+        $records = recordedIn($this->dir);
+
+        expect($records)->toHaveCount(1)
+            ->and($records[0]['error']['message'] ?? null)->toContain('no response');
+    });
+
+    it('is not recorded when it was removed before it ever ran', function (): void {
+        // No curl_multi_exec() between add and remove: curl never opened a
+        // connection, so no request was made to record.
+        $base = multiTestServer();
+
+        $multi = curl_multi_init();
+        $handle = curl_init("{$base}/never");
+        curl_setopt($handle, CURLOPT_RETURNTRANSFER, true);
+        curl_multi_add_handle($multi, $handle);
+        curl_multi_remove_handle($multi, $handle);
+
+        expect(recordedIn($this->dir))->toBe([]);
+    });
+
+    it('keeps the outcome curl reported when the loop did read it', function (): void {
+        $base = multiTestServer();
+
+        $multi = curl_multi_init();
+        $handle = curl_init("{$base}/slow");
+        curl_setopt_array($handle, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT_MS => 300]);
+        curl_multi_add_handle($multi, $handle);
+        drainMulti($multi);
+
+        while (curl_multi_info_read($multi)) {
+        }
+
+        curl_multi_remove_handle($multi, $handle);
+
+        $records = recordedIn($this->dir);
+
+        expect($records)->toHaveCount(1)
+            ->and($records[0]['error']['errno'] ?? null)->toBe(CURLE_OPERATION_TIMEDOUT)
+            ->and($records[0]['context'])->not->toHaveKey('transfer_outcome');
+    });
+});
+
+/**
+ * An async transfer belongs to the unit of work that started it. A worker
+ * that adds a transfer during one job and drains it during the next must not
+ * file it under the next job.
+ */
+it('files a multi transfer under the correlation it started in', function (): void {
+    $base = multiTestServer();
+
+    Ssx\Wiretap\Correlation::start('job-a');
+
+    $multi = curl_multi_init();
+    $handle = curl_init("{$base}/async-job");
+    curl_setopt($handle, CURLOPT_RETURNTRANSFER, true);
+    curl_multi_add_handle($multi, $handle);
+
+    Ssx\Wiretap\Correlation::start('job-b');
+    // job-b's own first call, so job-b's sequence has moved on as well.
+    Ssx\Wiretap\Correlation::nextSequence();
+
+    drainMulti($multi);
+
+    while (curl_multi_info_read($multi)) {
+    }
+
+    curl_multi_remove_handle($multi, $handle);
+
+    $records = recordedIn($this->dir);
+
+    Ssx\Wiretap\Correlation::reset();
+
+    expect($records)->toHaveCount(1)
+        ->and($records[0]['correlation_id'])->toBe('job-a')
+        ->and($records[0]['sequence'])->toBe(0);
 });

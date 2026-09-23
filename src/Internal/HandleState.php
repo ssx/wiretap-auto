@@ -33,6 +33,23 @@ final class HandleState
 
     private float $startedAt = 0.0;
 
+    /**
+     * The correlation and sequence the transfer started under. A multi
+     * transfer can finish long after the unit of work that began it has
+     * ended, so these are taken when it starts, not when it is recorded.
+     */
+    private ?string $correlationId = null;
+
+    private ?int $sequence = null;
+
+    /**
+     * The multi handle this transfer runs on, and how far it had got when
+     * the transfer joined it. Null for curl_exec().
+     */
+    private ?MultiProgress $multi = null;
+
+    private int $addedAtExec = 0;
+
     private bool $capturing = false;
 
     private bool $headersInstalled = false;
@@ -527,9 +544,12 @@ final class HandleState
         return $this->headersTruncated;
     }
 
-    public function beginTransfer(bool $capturing): void
+    public function beginTransfer(bool $capturing, ?string $correlationId = null, ?int $sequence = null): void
     {
         $this->capturing = $capturing;
+        $this->correlationId = $correlationId;
+        $this->sequence = $sequence;
+        $this->multi = null;
         $this->startedAt = microtime(true);
         $this->responseHeaderBuffer = '';
         $this->currentHeaderBlock = '';
@@ -558,6 +578,32 @@ final class HandleState
     public function startedAt(): float
     {
         return $this->startedAt;
+    }
+
+    public function joinMulti(MultiProgress $multi): void
+    {
+        $this->multi = $multi;
+        $this->addedAtExec = $multi->execs();
+    }
+
+    /**
+     * Where the multi transfer had got, as far as curl_multi_exec() said.
+     *
+     * @return 'unstarted'|'running'|'finished'|null null when not on a multi handle
+     */
+    public function multiPhase(): ?string
+    {
+        return $this->multi?->phaseOf($this->addedAtExec);
+    }
+
+    public function correlationId(): ?string
+    {
+        return $this->correlationId;
+    }
+
+    public function sequence(): ?int
+    {
+        return $this->sequence;
     }
 
     public function markHeadersInstalled(): void
