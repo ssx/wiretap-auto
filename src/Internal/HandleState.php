@@ -42,6 +42,11 @@ final class HandleState
      */
     private ?string $unsafeReason = null;
 
+    /**
+     * A bridge recording this transfer itself has claimed the handle.
+     */
+    private bool $claimed = false;
+
     private const MAX_HEADER_BLOCK_BYTES = 65536;
 
     private const MAX_HEADER_CHAIN_BYTES = 262144;
@@ -570,6 +575,9 @@ final class HandleState
         $copy->headerTarget = $this->headerTarget;
         $copy->headersInstalled = $this->headersInstalled;
         $copy->unsafeReason = $this->unsafeReason;
+        // curl_copy_handle() copies the options the claim arrived with, so
+        // the copy is the bridge's transfer too.
+        $copy->claimed = $this->claimed;
 
         return $copy;
     }
@@ -590,6 +598,8 @@ final class HandleState
         // curl_reset puts the handle back to defaults, which is the one thing
         // that can make a divergent shadow state agree again.
         $this->unsafeReason = null;
+        // The claim was one of the options, and the options are gone.
+        $this->claimed = false;
     }
 
     /**
@@ -617,5 +627,23 @@ final class HandleState
     public function unsafeReason(): ?string
     {
         return $this->unsafeReason;
+    }
+
+    /**
+     * Record that a bridge has claimed this handle's transfers.
+     *
+     * The bridge records the exchange itself, with bodies. Recording it here
+     * as well gave every call two unlinked records, so a claimed handle is
+     * never captured. The claim lasts as long as the options it came with:
+     * until curl_reset().
+     */
+    public function claim(): void
+    {
+        $this->claimed = true;
+    }
+
+    public function isClaimed(): bool
+    {
+        return $this->claimed;
     }
 }

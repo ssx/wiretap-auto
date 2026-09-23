@@ -73,7 +73,19 @@ synchronous path too and is not specific to async. Code using
 
 If you own the client, the bridge packages capture bodies in every case —
 [`ssx/wiretap-guzzle`](https://github.com/ssx/wiretap-guzzle) and
-[`ssx/wiretap-symfony`](https://github.com/ssx/wiretap-symfony).
+[`ssx/wiretap-symfony`](https://github.com/ssx/wiretap-symfony). Run one
+alongside this package and each call is still recorded once: the bridge
+claims the requests it records, and the hooks record nothing for a claimed
+transfer, on any redirect or retry hop. The bridge's record, with bodies, is
+the one you get; this package keeps covering everything the bridge does not
+see. That needs wiretap-guzzle v0.0.10 or wiretap-symfony v0.0.7 or later.
+
+The claim is read where Guzzle's `CurlFactory` and Symfony's
+`CurlHttpClient` build their curl handles. A client that builds handles some
+other way, such as a custom `CurlFactoryInterface`, is recorded by both, which
+is a duplicate record and nothing worse: the request itself is never changed.
+`Wiretap::diagnostics()` reports `transfer_claim: honoured` when this is
+active.
 
 ## How it works
 

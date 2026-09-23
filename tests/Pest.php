@@ -19,6 +19,20 @@ if (!is_dir($docroot)) {
 
 file_put_contents($docroot . '/index.php', <<<'ROUTER'
 <?php
+// A redirect, and an endpoint that fails every other call, for exercising
+// the hops a client makes on its own.
+if (str_starts_with($_SERVER['REQUEST_URI'], '/redirect')) {
+    header('Location: /echo?from=redirect', true, 302);
+    exit;
+}
+if (preg_match('~^/flaky/([a-z0-9]+)~', $_SERVER['REQUEST_URI'], $m)) {
+    $counter = sys_get_temp_dir() . '/wiretap-auto-flaky-' . $m[1];
+    $seen = (int) @file_get_contents($counter);
+    file_put_contents($counter, (string) ($seen + 1));
+    if ($seen % 2 === 0) {
+        http_response_code(503);
+    }
+}
 header('Content-Type: application/json');
 header('X-Test-Server: wiretap');
 echo json_encode([
@@ -53,3 +67,30 @@ register_shutdown_function(static function () use ($server): void {
         proc_close($server);
     }
 });
+
+/**
+ * Runs a snippet in a fresh PHP process that autoloads this package the way
+ * an application does, and returns whether the claim came out honoured.
+ */
+function honouredInFreshProcess(array $env, string $phpArgs = ''): string
+{
+    $script = sprintf(
+        'require %s; echo Ssx\Wiretap\TransferClaim::isHonoured() ? "yes" : "no";',
+        var_export(dirname(__DIR__) . '/vendor/autoload.php', true),
+    );
+
+    $process = proc_open(
+        trim(PHP_BINARY . ' ' . $phpArgs) . ' -r ' . escapeshellarg($script),
+        [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+        $pipes,
+        null,
+        $env + getenv(),
+    );
+
+    $out = stream_get_contents($pipes[1]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    proc_close($process);
+
+    return (string) $out;
+}

@@ -20,13 +20,13 @@
     "require": {
         "php": "^8.2",
         "ext-curl": "*",
-        "ssx/wiretap": "~0.0.5 || dev-main"
+        "ssx/wiretap": "~0.0.19 || dev-main"
     },
     "require-dev": {
         "guzzlehttp/guzzle": "^7.5",
         "pestphp/pest": "^2.34",
         "phpstan/phpstan": "^1.11",
-        "symfony/http-client": "^7.4"
+        "symfony/http-client": "^6.4 || ^7.4"
     },
     "suggest": {
         "ext-opentelemetry": "Required for capture. Without it this package is inert."

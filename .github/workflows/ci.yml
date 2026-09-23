@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   test:
-    name: PHP ${{ matrix.php }} (ext-opentelemetry ${{ matrix.otel }})
+    name: PHP ${{ matrix.php }} (ext-opentelemetry ${{ matrix.otel }})${{ matrix.symfony && format(' / Symfony {0}', matrix.symfony) || '' }}
     runs-on: ubuntu-latest
 
     strategy:
@@ -18,11 +18,19 @@ jobs:
       matrix:
         php: ['8.2', '8.3', '8.4']
         otel: ['yes']
+        # Empty means whatever composer resolves; an include below adds 6.4
+        # as a leg of its own rather than replacing the 8.2 one.
+        symfony: ['']
         include:
           # The package must be inert, not broken, when the extension is
           # absent. Integration tests skip themselves; nothing may fatal.
           - php: '8.2'
             otel: 'no'
+          # The transfer claim hooks Symfony's CurlResponse constructor,
+          # so both supported majors are exercised.
+          - php: '8.2'
+            otel: 'yes'
+            symfony: '6.4'
 
     steps:
       - uses: actions/checkout@v4
@@ -53,7 +61,7 @@ jobs:
           exit 0
 
       - name: Install dependencies
-        run: composer update --prefer-dist --no-interaction --no-progress
+        run: composer update --prefer-dist --no-interaction --no-progress ${{ matrix.symfony && format('--with=symfony/http-client:^{0}', matrix.symfony) || '' }}
 
       - name: Run tests
         run: vendor/bin/pest

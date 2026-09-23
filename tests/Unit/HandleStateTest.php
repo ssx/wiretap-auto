@@ -283,3 +283,18 @@ describe('coverage diagnostics', function (): void {
             ->and($diagnostics['curl_exec (sync)'])->toContain('captured');
     });
 });
+
+it('carries a bridge claim to a copy, and drops it on reset', function (): void {
+    $state = new HandleState();
+
+    expect($state->isClaimed())->toBeFalse();
+
+    $state->claim();
+
+    expect($state->isClaimed())->toBeTrue()
+        ->and($state->copy()->isClaimed())->toBeTrue();
+
+    $state->reset();
+
+    expect($state->isClaimed())->toBeFalse();
+});
