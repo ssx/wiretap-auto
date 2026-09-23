@@ -8,6 +8,7 @@ use Ssx\Wiretap\Auto\Internal\ExchangeFactory;
 use Ssx\Wiretap\Auto\Internal\HandleRegistry;
 use Ssx\Wiretap\Auto\Internal\HandleState;
 use Ssx\Wiretap\Contract\HookDriver;
+use Ssx\Wiretap\Correlation;
 use Ssx\Wiretap\Recorder;
 use Ssx\Wiretap\TransferClaim;
 
@@ -341,13 +342,23 @@ final class OtelHookDriver implements HookDriver
             $capture = $this->installCaptureOptions($handle, $state);
         }
 
-        $state->beginTransfer($capture);
+        // The correlation and sequence are the ones in scope now. A multi
+        // transfer is recorded when it finishes, which in a worker can be
+        // during the next job, and it belongs to the one that started it.
+        $state->beginTransfer(
+            $capture,
+            $capture ? Correlation::id() : null,
+            $capture ? Correlation::nextSequence() : null,
+        );
     }
 
     /**
      * Record a finished transfer, if it was one we were capturing.
+     *
+     * @param bool $reported whether curl reported how it ended: curl_exec
+     *                       returning, or curl_multi_info_read saying so
      */
-    private function finishTransfer(mixed $handle, mixed $result): void
+    private function finishTransfer(mixed $handle, mixed $result, bool $reported = true): void
     {
         if (!$handle instanceof \CurlHandle || !$this->registry->has($handle)) {
             return;
@@ -373,6 +384,7 @@ final class OtelHookDriver implements HookDriver
             result: $result,
             errno: $errno,
             error: $errno !== 0 ? curl_error($handle) : '',
+            reported: $reported,
         ));
     }
 
@@ -389,8 +401,9 @@ final class OtelHookDriver implements HookDriver
      *
      * The shape is the same as the synchronous path, just spread out in time:
      * add_handle is where curl_exec's pre would have run, and completion is
-     * reported by info_read or by remove_handle, whichever the application
-     * uses. Both are hooked, and finishTransfer() is idempotent per transfer.
+     * reported by info_read. remove_handle records a transfer info_read never
+     * reported, as one whose outcome is unknown. finishTransfer() is
+     * idempotent per transfer.
      */
     private function hookMulti(): void
     {
@@ -420,8 +433,16 @@ final class OtelHookDriver implements HookDriver
             $this->finishTransfer($handle, $this->multiContent($handle));
         });
 
-        // The backstop, for an application that never calls info_read. Runs
-        // before the handle leaves the stack, while its info is still readable.
+        // The backstop, for a transfer info_read never reported. Runs before
+        // the handle leaves the stack, while its info is still readable.
+        //
+        // Removal is also how a transfer is cancelled — Guzzle's cancel(), a
+        // Symfony response destroyed early, a loop giving up on a timeout —
+        // and nothing here can tell that apart from one that finished: curl
+        // reports the outcome only through info_read, so curl_errno() is 0
+        // even for a transfer curl timed out. Such a transfer is recorded,
+        // because the request was made, but as a failure with no response
+        // body, never as a success.
         $this->hook('curl_multi_remove_handle', pre: function (mixed $obj, array $params): void {
             $handle = $params[1] ?? null;
 
@@ -429,7 +450,7 @@ final class OtelHookDriver implements HookDriver
                 return;
             }
 
-            $this->finishTransfer($handle, $this->multiContent($handle));
+            $this->finishTransfer($handle, false, reported: false);
         });
     }
 

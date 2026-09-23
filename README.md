@@ -58,10 +58,17 @@ after    recorded 5:
            /sync     status=200
 ```
 
-A transfer is set up when it enters the multi stack and recorded when the
-application learns it finished — either `curl_multi_info_read()`, which is what
-Guzzle's handler uses, or `curl_multi_remove_handle()` for code that never asks.
-Both are hooked and recording happens once per transfer either way.
+A transfer is set up when it enters the multi stack, takes the correlation id
+and sequence in scope at that moment, and is recorded when
+`curl_multi_info_read()` reports it finished, which is what Guzzle's and
+Symfony's handlers use. `curl_multi_remove_handle()` is also how a transfer is
+cancelled, and curl reports how a transfer ended only through
+`curl_multi_info_read()` (`curl_errno()` stays 0 even after a timeout), so a
+transfer removed before that is recorded as a failure, `removed before curl
+reported it complete; outcome unknown`, with no response body. A loop that
+never calls `curl_multi_info_read()` gets failure records for that reason: it
+cannot tell a success from a timeout either. Recording happens once per
+transfer.
 
 ### Response bodies
 

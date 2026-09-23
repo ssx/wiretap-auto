@@ -29,6 +29,12 @@ use Ssx\Wiretap\TransferError;
 final readonly class ExchangeFactory
 {
     /**
+     * Cancelled, timed out, never started or finished unread: without
+     * curl_multi_info_read there is no telling which.
+     */
+    public const UNREPORTED = 'removed before curl reported it complete; outcome unknown';
+
+    /**
      * @param int $maxBodyBytes A hard memory ceiling, not the redaction limit.
      *
      * Capturing only 64 KiB here handed the redactor a truncated JSON body it
@@ -43,6 +49,12 @@ final readonly class ExchangeFactory
     /**
      * @param array<string, mixed> $info    curl_getinfo() output
      * @param mixed                $result  the curl_exec() return value
+     * @param bool                 $reported whether curl reported how the
+     *                                       transfer ended. A multi transfer
+     *                                       removed before curl_multi_info_read
+     *                                       said so may have been cancelled,
+     *                                       timed out or never started, and
+     *                                       curl_errno() cannot tell which.
      */
     public function create(
         HandleState $state,
@@ -50,6 +62,7 @@ final readonly class ExchangeFactory
         mixed $result,
         int $errno = 0,
         string $error = '',
+        bool $reported = true,
     ): Exchange {
         $effectiveUrl = is_string($info['url'] ?? null) ? $info['url'] : ($state->url() ?? '');
         $sent = $this->sentRequestHeaders($info);
@@ -57,7 +70,7 @@ final readonly class ExchangeFactory
 
         return new Exchange(
             id: Ulid::generate($state->startedAt() ?: null),
-            correlationId: Correlation::id(),
+            correlationId: $state->correlationId() ?? Correlation::id(),
             transport: Exchange::TRANSPORT_CURL,
             method: $state->method(),
             uri: $effectiveUrl,
@@ -66,19 +79,36 @@ final readonly class ExchangeFactory
             status: $this->status($info),
             reason: null,
             responseHeaders: Headers::fromRaw($state->finalResponseHeaderBlock()),
-            responseBody: $this->responseBody($state, $result),
+            // Whatever arrived before it was removed is a prefix at best, and
+            // must not pass for the response.
+            responseBody: $reported
+                ? $this->responseBody($state, $result)
+                : CapturedBody::omitted(CapturedBody::OMITTED_NOT_READABLE),
             timings: Timings::fromCurlInfo($info),
-            error: $errno !== 0
-                ? new TransferError($errno, $error !== '' ? $error : 'curl error ' . $errno)
-                : null,
+            error: $this->error($errno, $error, $reported),
             startedAt: $state->startedAt(),
-            sequence: Correlation::nextSequence(),
+            sequence: $state->sequence() ?? Correlation::nextSequence(),
             pid: getmypid() ?: null,
             // Says which it is. A rebuilt set leaves out whatever the options
             // do not determine (Digest, a multipart boundary, curl's cookie
             // jar), so it must not pass for the bytes on the wire.
             context: ['request_headers' => $sent === null ? 'reconstructed' : 'sent'],
         );
+    }
+
+    private function error(int $errno, string $error, bool $reported): ?TransferError
+    {
+        if ($errno !== 0) {
+            return new TransferError($errno, $error !== '' ? $error : 'curl error ' . $errno);
+        }
+
+        // Not a success: nothing says it was one. -1, as for any failure that
+        // is not a curl error code.
+        if (!$reported) {
+            return new TransferError(-1, self::UNREPORTED);
+        }
+
+        return null;
     }
 
     /**

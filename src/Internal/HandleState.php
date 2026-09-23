@@ -33,6 +33,15 @@ final class HandleState
 
     private float $startedAt = 0.0;
 
+    /**
+     * The correlation and sequence the transfer started under. A multi
+     * transfer can finish long after the unit of work that began it has
+     * ended, so these are taken when it starts, not when it is recorded.
+     */
+    private ?string $correlationId = null;
+
+    private ?int $sequence = null;
+
     private bool $capturing = false;
 
     private bool $headersInstalled = false;
@@ -527,9 +536,11 @@ final class HandleState
         return $this->headersTruncated;
     }
 
-    public function beginTransfer(bool $capturing): void
+    public function beginTransfer(bool $capturing, ?string $correlationId = null, ?int $sequence = null): void
     {
         $this->capturing = $capturing;
+        $this->correlationId = $correlationId;
+        $this->sequence = $sequence;
         $this->startedAt = microtime(true);
         $this->responseHeaderBuffer = '';
         $this->currentHeaderBlock = '';
@@ -558,6 +569,16 @@ final class HandleState
     public function startedAt(): float
     {
         return $this->startedAt;
+    }
+
+    public function correlationId(): ?string
+    {
+        return $this->correlationId;
+    }
+
+    public function sequence(): ?int
+    {
+        return $this->sequence;
     }
 
     public function markHeadersInstalled(): void
