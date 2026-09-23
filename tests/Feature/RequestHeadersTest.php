@@ -57,7 +57,6 @@ it('rebuilds exactly what curl sent, in the order it sent it', function (string 
     'USERPWD' => ['/echo', [CURLOPT_USERPWD => 'user:pass']],
     'USERNAME and PASSWORD' => ['/echo', [CURLOPT_USERNAME => 'user', CURLOPT_PASSWORD => 'pass']],
     'USERNAME alone' => ['/echo', [CURLOPT_USERNAME => 'user']],
-    'PASSWORD alone' => ['/echo', [CURLOPT_PASSWORD => 'pass']],
     'USERNAME after USERPWD' => ['/echo', [CURLOPT_USERPWD => 'first:pass', CURLOPT_USERNAME => 'second']],
     'credentials in the URL' => ['http://us%40r:p%3Ass@127.0.0.1:' . TEST_SERVER_PORT . '/echo', []],
     'USERPWD over URL credentials' => ['http://url:pw@127.0.0.1:' . TEST_SERVER_PORT . '/echo', [CURLOPT_USERPWD => 'opt:pw']],
@@ -100,3 +99,11 @@ it('leaves out what the options do not determine, and invents nothing', function
     'chunked upload' => ['/echo', [CURLOPT_PUT => true, CURLOPT_READFUNCTION => static fn (): string => ''], ['transfer-encoding', 'expect']],
     'cookies from curl\'s own jar' => ['/setcookie', [CURLOPT_FOLLOWLOCATION => true, CURLOPT_COOKIEFILE => '', CURLOPT_COOKIE => 'a=1'], ['cookie']],
 ]);
+
+it('leaves out a password set without a user name, which libcurl versions disagree on', function (): void {
+    ['sent' => $sent, 'rebuilt' => $rebuilt] = sentAndRebuilt('/echo', [CURLOPT_PASSWORD => 'pass']);
+
+    // 8.22 sends `Authorization: Basic OnBhc3M=`; older builds send nothing.
+    expect(array_values(array_diff($rebuilt, $sent)))->toBe([])
+        ->and(preg_grep('/^Authorization:/i', $rebuilt))->toBe([]);
+});

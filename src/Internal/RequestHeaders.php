@@ -209,15 +209,22 @@ final class RequestHeaders
 
     /**
      * user:password as curl will send it: the options win over credentials in
-     * the URL, and either half on its own is sent with the other empty.
+     * the URL, and a user name on its own is sent with an empty password.
+     *
+     * A password with no user name is sent by recent libcurl (8.22 sends
+     * `:password`) and not by older builds, so it is left out.
      */
     private static function credentials(HandleState $state): ?string
     {
         $user = $state->get(CURLOPT_USERNAME);
         $password = $state->get(CURLOPT_PASSWORD);
 
-        if (is_string($user) || is_string($password)) {
-            return (is_string($user) ? $user : '') . ':' . (is_string($password) ? $password : '');
+        if (is_string($user)) {
+            return $user . ':' . (is_string($password) ? $password : '');
+        }
+
+        if (is_string($password)) {
+            return null;
         }
 
         $parts = parse_url((string) $state->url());
