@@ -9,6 +9,7 @@ use Ssx\Wiretap\Auto\Internal\HandleRegistry;
 use Ssx\Wiretap\Auto\Internal\HandleState;
 use Ssx\Wiretap\Contract\HookDriver;
 use Ssx\Wiretap\Recorder;
+use Ssx\Wiretap\TransferClaim;
 
 /**
  * Installs curl hooks through ext-opentelemetry.
@@ -94,6 +95,87 @@ final class OtelHookDriver implements HookDriver
         $this->hookLifecycle();
         $this->hookExec();
         $this->hookMulti();
+
+        // Bridges add the claim only once this is set, so that without these
+        // hooks their request options are exactly what they always were.
+        if ($this->hookClaims()) {
+            TransferClaim::honour();
+        }
+    }
+
+    /**
+     * Read a bridge's claim where each client turns a request into a handle.
+     *
+     * A bridge records the exchange itself, with the bodies this layer cannot
+     * see, and marks the request with TransferClaim::KEY. Recording the same
+     * transfer here as well gave every call two unlinked records. The claim
+     * is a request option, not a curl option, so it is read from the client
+     * rather than from curl_setopt: Guzzle deprecates unknown curl options
+     * from 7.12, and curl itself rejects them.
+     *
+     * If either client changes these internals, or an application uses its
+     * own CurlFactoryInterface, the claim is simply not seen and the transfer
+     * is recorded here too: a duplicate record, never a changed request.
+     *
+     * @return bool whether both claim hooks were installed
+     */
+    private function hookClaims(): bool
+    {
+        // Guzzle: CurlFactory::create() builds the handle for every hop,
+        // sync and multi, with the request options for that hop. Redirect
+        // and retry middleware pass the same options on, so every hop of a
+        // claimed request is claimed. Read in post, where the handle exists,
+        // which is before curl_exec() or curl_multi_add_handle() sees it.
+        $guzzle = $this->hook(
+            'GuzzleHttp\Handler\CurlFactory',
+            'create',
+            post: function (mixed $factory, array $params, mixed $easy): void {
+                try {
+                    if (!self::claimed($params[1] ?? null)) {
+                        return;
+                    }
+
+                    $handle = is_object($easy) ? ($easy->handle ?? null) : null;
+
+                    if ($handle instanceof \CurlHandle) {
+                        $this->registry->for($handle)->claim();
+                    }
+                } catch (\Throwable) {
+                    // Instrumentation must never change application behaviour.
+                }
+            },
+        );
+
+        // Symfony: CurlHttpClient has set every option on the handle by the
+        // time it constructs the response, and the constructor is where the
+        // handle is added to the multi stack. Its options are the resolved
+        // ones, so a claim set in `extra` is there. Symfony's retry layer
+        // re-issues the same options, and its redirects reuse the handle.
+        $symfony = $this->hook(
+            'Symfony\Component\HttpClient\Response\CurlResponse',
+            '__construct',
+            pre: function (mixed $response, array $params): void {
+                try {
+                    $handle = $params[1] ?? null;
+                    $options = $params[2] ?? null;
+
+                    if ($handle instanceof \CurlHandle
+                        && is_array($options)
+                        && self::claimed($options['extra'] ?? null)) {
+                        $this->registry->for($handle)->claim();
+                    }
+                } catch (\Throwable) {
+                    // Instrumentation must never change application behaviour.
+                }
+            },
+        );
+
+        return $guzzle && $symfony;
+    }
+
+    private static function claimed(mixed $options): bool
+    {
+        return is_array($options) && ($options[TransferClaim::KEY] ?? null) === true;
     }
 
     private function hookInit(): void
@@ -243,7 +325,11 @@ final class OtelHookDriver implements HookDriver
         // a record built on a guess about CURLOPT_HEADER can put unredacted
         // response headers in the body, and no record is better than a wrong
         // one.
+        //
+        // A handle a bridge has claimed is the bridge's to record. Nothing is
+        // installed on it either.
         $capture = $url !== null
+            && !$state->isClaimed()
             && !$state->isUnsafe()
             && $this->recorder()->shouldCapture($url);
 
@@ -478,13 +564,21 @@ final class OtelHookDriver implements HookDriver
         return true;
     }
 
-    private function hook(string $function, ?\Closure $pre = null, ?\Closure $post = null): void
+    /**
+     * Hook a function, or a method when given a class and a method name.
+     *
+     * @return bool whether the extension installed it
+     */
+    private function hook(string $classOrFunction, ?string $method = null, ?\Closure $pre = null, ?\Closure $post = null): bool
     {
+        [$class, $function] = $method === null ? [null, $classOrFunction] : [$classOrFunction, $method];
+
         try {
-            (self::HOOK_FUNCTION)(null, $function, pre: $pre, post: $post);
+            return (self::HOOK_FUNCTION)($class, $function, pre: $pre, post: $post) !== false;
         } catch (\Throwable) {
             // A hook that cannot be installed leaves that function
             // uninstrumented. It must not take the application down with it.
+            return false;
         }
     }
 
@@ -498,6 +592,7 @@ final class OtelHookDriver implements HookDriver
             'version' => (string) (phpversion('opentelemetry') ?: 'n/a'),
             'hook_api' => function_exists(self::HOOK_FUNCTION) ? 'available' : 'MISSING',
             'registered' => $this->registered ? 'yes' : 'no',
+            'transfer_claim' => TransferClaim::isHonoured() ? 'honoured' : 'not honoured',
             'live_handles' => (string) $this->registry->count(),
             'php' => PHP_VERSION,
             'curl' => (string) (curl_version()['version'] ?? 'n/a'),
