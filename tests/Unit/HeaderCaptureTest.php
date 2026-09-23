@@ -119,7 +119,7 @@ describe('registry capacity', function (): void {
         expect($state->isUnsafe())->toBeTrue()
             ->and($registry->has($overflow))->toBeFalse()
             ->and($registry->count())->toBe(3)
-            ->and($registry->for($live[0])->appHeaderFunction())->not->toBeNull();
+            ->and($registry->for($live[0])->hasAppHeaderFunction())->toBeTrue();
     });
 
     it('takes new handles again once the application has finished with others', function (): void {
@@ -148,6 +148,6 @@ describe('registry capacity', function (): void {
         $registry->copy($source, $copy);
 
         expect($registry->has($copy))->toBeFalse()
-            ->and($registry->for($source)->appHeaderFunction())->not->toBeNull();
+            ->and($registry->for($source)->hasAppHeaderFunction())->toBeTrue();
     });
 });

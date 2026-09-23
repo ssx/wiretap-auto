@@ -75,7 +75,10 @@ it('captures a raw curl_exec with no application changes', function (): void {
         ->and($exchange->status)->toBe(200)
         ->and($exchange->requestBody->bytes)->toBe('{"hello":"world"}')
         ->and($exchange->responseBody->isPresent())->toBeTrue()
-        ->and($exchange->requestHeaders->has('Host'))->toBeTrue()
+        // The headers the application configured, marked as such: libcurl's
+        // own additions are only knowable through CURLINFO_HEADER_OUT.
+        ->and($exchange->requestHeaders->first('Content-Type'))->toBe('application/json')
+        ->and($exchange->context['request_headers'] ?? null)->toBe('configured')
         ->and($exchange->responseHeaders->has('Content-Type'))->toBeTrue()
         ->and($exchange->timings->total)->toBeGreaterThan(0);
 });
@@ -204,4 +207,157 @@ it('exposes the same recorder through either facade', function (): void {
 
     expect(Core::recorder())->toBe($recorder)
         ->and(Wiretap::recorder())->toBe($recorder);
+});
+
+it('lets a handle whose callbacks refer back to its owner be freed', function (): void {
+    // The common SDK shape: an object owns a handle, and the handle's
+    // callbacks are closures or methods bound to that object. On PHP 8.2 a
+    // WeakMap does not collect a cycle that runs from a value back to its own
+    // key, so a shadow state holding those callbacks kept the handle, the
+    // owner and everything it referenced alive for the life of the process —
+    // and once the registry filled, capture stopped everywhere.
+    $recorder = useRecorder($this->sink);
+    $freed = new ArrayObject();
+    $url = 'http://127.0.0.1:' . TEST_SERVER_PORT . '/owned';
+
+    for ($i = 0; $i < 20; ++$i) {
+        $owner = new class ($url, $freed) {
+            public \CurlHandle $handle;
+
+            public function __construct(string $url, private ArrayObject $freed)
+            {
+                $this->handle = curl_init($url);
+                curl_setopt($this->handle, CURLOPT_HEADERFUNCTION, fn ($ch, string $line): int => strlen($line));
+                curl_setopt($this->handle, CURLOPT_WRITEFUNCTION, [$this, 'onBody']);
+            }
+
+            public function onBody(\CurlHandle $ch, string $data): int
+            {
+                return strlen($data);
+            }
+
+            public function __destruct()
+            {
+                $this->freed->append(true);
+            }
+        };
+
+        curl_exec($owner->handle);
+        unset($owner);
+    }
+
+    gc_collect_cycles();
+    $recorder->flush();
+
+    expect(count($freed))->toBe(20)
+        ->and($this->sink->all())->toHaveCount(20);
+});
+
+it('does not put request headers where the application can read them', function (): void {
+    // CURLINFO_HEADER_OUT makes the sent headers, Authorization included,
+    // part of curl_getinfo(). Guzzle copies that into handler stats and into
+    // exception context, which is how it reaches logs and error trackers.
+    $recorder = useRecorder($this->sink);
+
+    $ch = curl_init('http://127.0.0.1:' . TEST_SERVER_PORT . '/echo');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => ['Authorization: Bearer app-secret', 'X-Tenant: alpha'],
+    ]);
+    curl_exec($ch);
+    $recorder->flush();
+
+    $exchange = $this->sink->all()[0];
+
+    expect(curl_getinfo($ch))->not->toHaveKey('request_header')
+        ->and(curl_getinfo($ch, CURLINFO_HEADER_OUT))->toBeFalse()
+        // The record falls back to the headers the application configured,
+        // and says that is what they are.
+        ->and($exchange->requestHeaders->first('X-Tenant'))->toBe('alpha')
+        ->and($exchange->context['request_headers'] ?? null)->toBe('configured');
+});
+
+it('keeps Guzzle handler stats free of request headers', function (): void {
+    useRecorder($this->sink);
+    $stats = null;
+
+    (new GuzzleHttp\Client())->get('http://127.0.0.1:' . TEST_SERVER_PORT . '/echo', [
+        'headers' => ['Authorization' => 'Bearer app-secret'],
+        'on_stats' => static function (GuzzleHttp\TransferStats $s) use (&$stats): void {
+            $stats = $s->getHandlerStats();
+        },
+    ]);
+
+    expect($stats)->toBeArray()
+        ->and($stats)->not->toHaveKey('request_header');
+});
+
+it('uses the sent headers when the application asked curl for them itself', function (): void {
+    $recorder = useRecorder($this->sink);
+
+    $ch = curl_init('http://127.0.0.1:' . TEST_SERVER_PORT . '/echo');
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLINFO_HEADER_OUT => true]);
+    curl_exec($ch);
+    $recorder->flush();
+
+    $exchange = $this->sink->all()[0];
+
+    expect($exchange->requestHeaders->has('Host'))->toBeTrue()
+        ->and($exchange->context)->not->toHaveKey('request_headers');
+});
+
+it('leaves verbose output working when the application turns it on after a capture', function (): void {
+    useRecorder($this->sink);
+
+    $ch = curl_init('http://127.0.0.1:' . TEST_SERVER_PORT . '/echo');
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_exec($ch);
+
+    $stderr = fopen('php://temp', 'w+');
+    curl_setopt($ch, CURLOPT_STDERR, $stderr);
+    curl_setopt($ch, CURLOPT_VERBOSE, true);
+    curl_exec($ch);
+    rewind($stderr);
+
+    expect((string) stream_get_contents($stderr))->not->toBe('');
+});
+
+it('still calls a private header callback, and declines capture rather than drop it', function (): void {
+    // curl checks callability from the application's scope, so a private
+    // method is a valid callback there. From ours it is not callable at all,
+    // and the wrapper used to replace it with nothing to chain onto.
+    $recorder = useRecorder($this->sink);
+
+    $sdk = new class ('http://127.0.0.1:' . TEST_SERVER_PORT . '/private') {
+        public int $headers = 0;
+
+        public function __construct(private string $url)
+        {
+        }
+
+        public function run(): mixed
+        {
+            $ch = curl_init($this->url);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_HEADERFUNCTION, [$this, 'onHeader']);
+
+            return curl_exec($ch);
+        }
+
+        private function onHeader(\CurlHandle $ch, string $line): int
+        {
+            ++$this->headers;
+
+            return strlen($line);
+        }
+    };
+
+    $result = $sdk->run();
+    $recorder->flush();
+
+    expect($result)->toBeString()
+        ->and($sdk->headers)->toBeGreaterThan(0)
+        // Without a header capture we cannot trust, there is no true record
+        // to write, so there is none.
+        ->and($this->sink->all())->toBeEmpty();
 });

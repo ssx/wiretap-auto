@@ -46,17 +46,24 @@ final class HandleState
 
     private const MAX_HEADER_CHAIN_BYTES = 262144;
 
-    /** @var callable|null */
-    private $appHeaderFunction = null;
+    /**
+     * The application's own header callback, held weakly. See CallbackRef.
+     */
+    private ?CallbackRef $appHeaderFunction = null;
 
     public function set(int $option, mixed $value): void
     {
-        $this->options[$option] = $value;
+        // Callbacks and other objects are recorded as present, never held.
+        // This state is a WeakMap value keyed by the handle, and on PHP 8.2 a
+        // value that leads back to its key keeps both alive for good. Every
+        // question asked of these options is whether one is set, so nothing
+        // is lost by not keeping the object itself.
+        $this->options[$option] = self::shadowValue($value);
 
         // Remember the application's own header callback so ours can chain
         // onto it rather than silently replacing it.
         if ($option === CURLOPT_HEADERFUNCTION) {
-            $this->appHeaderFunction = is_callable($value) ? $value : null;
+            $this->appHeaderFunction = $value === null ? null : CallbackRef::of($value);
 
             // The application replaced the callback on a reused handle, which
             // removed our wrapper. Without this, headersInstalled stayed true
@@ -85,6 +92,33 @@ final class HandleState
         if ($option === CURLOPT_POST && self::curlBool($value)) {
             unset($this->options[CURLOPT_HTTPGET], $this->options[CURLOPT_NOBODY]);
         }
+    }
+
+    /**
+     * What to keep of an option value.
+     *
+     * An object, or an array holding one, becomes `true`: set, and on as far
+     * as curl's integer conversion is concerned, which is what ext-curl does
+     * with it too. A POSTFIELDS array holding a CURLFile therefore reads as
+     * a body we cannot reconstruct, which is the answer it always got.
+     */
+    private static function shadowValue(mixed $value): mixed
+    {
+        if (is_object($value)) {
+            return true;
+        }
+
+        if (is_array($value)) {
+            $objects = false;
+
+            array_walk_recursive($value, static function (mixed $item) use (&$objects): void {
+                $objects = $objects || is_object($item);
+            });
+
+            return $objects ? true : $value;
+        }
+
+        return $value;
     }
 
     /**
@@ -237,13 +271,9 @@ final class HandleState
             return $fields;
         }
 
+        // A CURLFile or any other object in the array was recorded as `true`
+        // rather than kept, so an array here holds only plain values.
         if (is_array($fields)) {
-            foreach ($fields as $value) {
-                if ($value instanceof \CURLFile || $value instanceof \CURLStringFile) {
-                    return null;
-                }
-            }
-
             return http_build_query($fields);
         }
 
@@ -263,12 +293,17 @@ final class HandleState
     }
 
     /**
-     * Headers the application set explicitly.
+     * Headers the application set explicitly, as curl sends them.
      *
-     * These are not the headers actually sent — libcurl adds its own, and
-     * CURLINFO_HEADER_OUT is what reports the real set. This is the fallback
-     * for when HEADER_OUT is unavailable because the application turned on
-     * CURLOPT_VERBOSE.
+     * These are not every header sent — libcurl adds its own, such as Host
+     * and Accept. Only CURLINFO_HEADER_OUT reports the full set, and turning
+     * that on ourselves put the plaintext request headers, Authorization
+     * included, into the application's own curl_getinfo(), from where Guzzle
+     * copies them into handler stats and exception context. So this is the
+     * record unless the application turned HEADER_OUT on itself.
+     *
+     * `Name:` with no value tells curl to remove a header it would have
+     * added, so nothing by that name is sent; `Name;` sends it empty.
      *
      * @return list<string>
      */
@@ -280,25 +315,27 @@ final class HandleState
             return [];
         }
 
-        return array_values(array_filter(
-            array_map(static fn (mixed $h): string => is_string($h) ? $h : '', $headers),
-            static fn (string $h): bool => $h !== '',
-        ));
-    }
+        $lines = [];
 
-    /**
-     * CURLINFO_HEADER_OUT and CURLOPT_VERBOSE occupy the same libcurl debug
-     * slot: setting one silently blanks the other, with no warning and no
-     * error. If the application asked for verbose output, that is theirs and
-     * we do not take it away.
-     */
-    public function canUseHeaderOut(): bool
-    {
-        // `CURLOPT_VERBOSE => 1` is the form most code uses. A strict !== true
-        // check read it as off, so wiretap installed CURLINFO_HEADER_OUT into
-        // the same libcurl debug slot and the application's verbose output
-        // silently stopped — diagnostics it had explicitly asked for.
-        return !$this->isOn(CURLOPT_VERBOSE);
+        foreach ($headers as $header) {
+            if (!is_string($header) || $header === '') {
+                continue;
+            }
+
+            if (preg_match('/^([^:;\s]+)\s*;\s*$/', $header, $m) === 1) {
+                $lines[] = $m[1] . ':';
+
+                continue;
+            }
+
+            if (preg_match('/^[^:]+:\s*$/', $header) === 1) {
+                continue;
+            }
+
+            $lines[] = $header;
+        }
+
+        return $lines;
     }
 
     public function returnsTransfer(): bool
@@ -312,9 +349,22 @@ final class HandleState
             || isset($this->options[CURLOPT_FILE]);
     }
 
-    public function appHeaderFunction(): ?callable
+    /**
+     * Whether the application set a header callback of its own.
+     */
+    public function hasAppHeaderFunction(): bool
     {
-        return $this->appHeaderFunction;
+        return $this->appHeaderFunction !== null;
+    }
+
+    /**
+     * The application's header callback as it gave it, or null if it has
+     * none or it can no longer be rebuilt. Callability is for the caller to
+     * judge from its own scope.
+     */
+    public function appHeaderFunction(): mixed
+    {
+        return $this->appHeaderFunction?->resolve();
     }
 
     /**
