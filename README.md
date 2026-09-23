@@ -61,14 +61,23 @@ after    recorded 5:
 A transfer is set up when it enters the multi stack, takes the correlation id
 and sequence in scope at that moment, and is recorded when
 `curl_multi_info_read()` reports it finished, which is what Guzzle's and
-Symfony's handlers use. `curl_multi_remove_handle()` is also how a transfer is
-cancelled, and curl reports how a transfer ended only through
-`curl_multi_info_read()` (`curl_errno()` stays 0 even after a timeout), so a
-transfer removed before that is recorded as a failure, `removed before curl
-reported it complete; outcome unknown`, with no response body. A loop that
-never calls `curl_multi_info_read()` gets failure records for that reason: it
-cannot tell a success from a timeout either. Recording happens once per
-transfer.
+Symfony's handlers use. curl reports how a transfer ended only there
+(`curl_errno()` stays 0 even after a timeout), and reading it for you would
+take the message from the application. So a transfer removed with
+`curl_multi_remove_handle()` without being reported is judged by what
+`curl_multi_exec()` said:
+
+- **it had finished** (an exec after it was added reported nothing running,
+  as in a loop that runs until `$running` is 0): recorded, with the outcome
+  read from its info. No response, a total time at the timeout, or fewer bytes
+  than the `Content-Length` makes it a failure; otherwise a success. The
+  record carries `context.transfer_outcome = "inferred"`, because a failure
+  that leaves none of those traces reads as a success.
+- **it was still running**: cancelled. A failure, `removed before curl
+  finished it; cancelled`, with no response body.
+- **it never ran**: nothing was sent, and nothing is recorded.
+
+Recording happens once per transfer.
 
 ### Response bodies
 

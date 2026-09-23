@@ -52,6 +52,15 @@ function multiTestServer(): string
             continue;
         }
 
+        // Promises more than it sends, then closes: curl reports this as a
+        // partial transfer, but only through curl_multi_info_read.
+        if (str_starts_with($request, 'GET /short')) {
+            fwrite($connection, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"partial\":");
+            fclose($connection);
+
+            continue;
+        }
+
         $body = '{"ok":1}';
         fwrite(
             $connection,
@@ -172,11 +181,6 @@ it('captures a raw curl_multi loop, body included', function (): void {
     curl_setopt($handle, CURLOPT_RETURNTRANSFER, true);
     curl_multi_add_handle($multi, $handle);
     drainMulti($multi);
-
-    // curl_multi_info_read is how curl says a transfer finished and how.
-    while (curl_multi_info_read($multi)) {
-    }
-
     curl_multi_remove_handle($multi, $handle);
     curl_multi_close($multi);
 
@@ -241,13 +245,52 @@ it('captures Symfony CurlHttpClient, which never calls curl_exec', function (): 
 });
 
 /**
- * curl_multi_remove_handle() is also how a transfer is cancelled: Guzzle's
- * cancel(), a Symfony response destroyed early, an event loop giving up. Only
- * curl_multi_info_read says a transfer finished and how, so a transfer
- * removed without it has no known outcome and must not read as a success.
+ * curl reports how a multi transfer ended only through curl_multi_info_read,
+ * and many loops never call it: they run curl_multi_exec until nothing is
+ * running and remove their handles, like PHP's manual and plenty of SDKs.
+ * curl_multi_remove_handle() is also how a transfer is cancelled. What
+ * curl_multi_exec() reported decides which one a removal was.
  */
-describe('a transfer removed before curl reported it complete', function (): void {
-    it('is not recorded as a success when cancelled mid-transfer', function (): void {
+describe('a transfer curl_multi_info_read never reported', function (): void {
+    it('is recorded as the success it was when the loop ran to the end', function (): void {
+        $base = multiTestServer();
+
+        $multi = curl_multi_init();
+        $handles = [];
+
+        foreach (['/sdk-1', '/sdk-2'] as $path) {
+            $handle = curl_init("{$base}{$path}");
+            curl_setopt_array($handle, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 10]);
+            curl_multi_add_handle($multi, $handle);
+            $handles[] = $handle;
+        }
+
+        // The shape of the loop in wiretap-examples' ShippingSdk.
+        do {
+            $status = curl_multi_exec($multi, $running);
+
+            if ($running) {
+                curl_multi_select($multi);
+            }
+        } while ($running && $status === CURLM_OK);
+
+        foreach ($handles as $handle) {
+            curl_multi_remove_handle($multi, $handle);
+        }
+
+        $records = recordedIn($this->dir);
+
+        expect($records)->toHaveCount(2);
+
+        foreach ($records as $record) {
+            expect($record['error'] ?? null)->toBeNull()
+                ->and($record['status'])->toBe(200)
+                ->and($record['response']['body']['bytes'])->toBe('{"ok":1}')
+                ->and($record['context']['transfer_outcome'] ?? null)->toBe('inferred');
+        }
+    });
+
+    it('is a failure when cancelled mid-transfer', function (): void {
         $base = multiTestServer();
 
         $multi = curl_multi_init();
@@ -260,13 +303,13 @@ describe('a transfer removed before curl reported it complete', function (): voi
         $records = recordedIn($this->dir);
 
         expect($records)->toHaveCount(1)
-            ->and($records[0]['error']['message'] ?? null)->toContain('removed before curl reported it complete')
+            ->and($records[0]['error']['message'] ?? null)->toContain('cancelled')
             // A partial body is not the response; it must not pass for one.
             ->and($records[0]['response']['body']['bytes'] ?? null)->toBeNull()
             ->and($records[0]['response']['body']['omitted_reason'] ?? null)->toBe('not-readable');
     });
 
-    it('is not recorded as a success when it timed out and nobody read the result', function (): void {
+    it('is a failure when it timed out', function (): void {
         $base = multiTestServer();
 
         $multi = curl_multi_init();
@@ -284,10 +327,44 @@ describe('a transfer removed before curl reported it complete', function (): voi
         $records = recordedIn($this->dir);
 
         expect($records)->toHaveCount(1)
-            ->and($records[0]['error'] ?? null)->not->toBeNull();
+            ->and($records[0]['error']['message'] ?? null)->toContain('timed out')
+            ->and($records[0]['response']['body']['bytes'] ?? null)->toBeNull();
     });
 
-    it('is not recorded as a success when it never started', function (): void {
+    it('is a failure when the response ended short of its Content-Length', function (): void {
+        $base = multiTestServer();
+
+        $multi = curl_multi_init();
+        $handle = curl_init("{$base}/short");
+        curl_setopt($handle, CURLOPT_RETURNTRANSFER, true);
+        curl_multi_add_handle($multi, $handle);
+        drainMulti($multi);
+        curl_multi_remove_handle($multi, $handle);
+
+        $records = recordedIn($this->dir);
+
+        expect($records)->toHaveCount(1)
+            ->and($records[0]['error']['message'] ?? null)->toContain('ended after 11 of 100 bytes')
+            ->and($records[0]['response']['body']['bytes'] ?? null)->toBeNull();
+    });
+
+    it('is a failure when nothing answered', function (): void {
+        $multi = curl_multi_init();
+        $handle = curl_init('http://127.0.0.1:1/refused');
+        curl_setopt($handle, CURLOPT_RETURNTRANSFER, true);
+        curl_multi_add_handle($multi, $handle);
+        drainMulti($multi);
+        curl_multi_remove_handle($multi, $handle);
+
+        $records = recordedIn($this->dir);
+
+        expect($records)->toHaveCount(1)
+            ->and($records[0]['error']['message'] ?? null)->toContain('no response');
+    });
+
+    it('is not recorded when it was removed before it ever ran', function (): void {
+        // No curl_multi_exec() between add and remove: curl never opened a
+        // connection, so no request was made to record.
         $base = multiTestServer();
 
         $multi = curl_multi_init();
@@ -296,14 +373,10 @@ describe('a transfer removed before curl reported it complete', function (): voi
         curl_multi_add_handle($multi, $handle);
         curl_multi_remove_handle($multi, $handle);
 
-        $records = recordedIn($this->dir);
-
-        expect($records)->toHaveCount(1)
-            ->and($records[0]['error']['message'] ?? null)->toContain('removed before curl reported it complete')
-            ->and($records[0]['status'] ?? null)->toBeNull();
+        expect(recordedIn($this->dir))->toBe([]);
     });
 
-    it('keeps the outcome curl reported when it timed out and the loop read it', function (): void {
+    it('keeps the outcome curl reported when the loop did read it', function (): void {
         $base = multiTestServer();
 
         $multi = curl_multi_init();
@@ -320,7 +393,8 @@ describe('a transfer removed before curl reported it complete', function (): voi
         $records = recordedIn($this->dir);
 
         expect($records)->toHaveCount(1)
-            ->and($records[0]['error']['errno'] ?? null)->toBe(CURLE_OPERATION_TIMEDOUT);
+            ->and($records[0]['error']['errno'] ?? null)->toBe(CURLE_OPERATION_TIMEDOUT)
+            ->and($records[0]['context'])->not->toHaveKey('transfer_outcome');
     });
 });
 

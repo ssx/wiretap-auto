@@ -42,6 +42,14 @@ final class HandleState
 
     private ?int $sequence = null;
 
+    /**
+     * The multi handle this transfer runs on, and how far it had got when
+     * the transfer joined it. Null for curl_exec().
+     */
+    private ?MultiProgress $multi = null;
+
+    private int $addedAtExec = 0;
+
     private bool $capturing = false;
 
     private bool $headersInstalled = false;
@@ -541,6 +549,7 @@ final class HandleState
         $this->capturing = $capturing;
         $this->correlationId = $correlationId;
         $this->sequence = $sequence;
+        $this->multi = null;
         $this->startedAt = microtime(true);
         $this->responseHeaderBuffer = '';
         $this->currentHeaderBlock = '';
@@ -569,6 +578,22 @@ final class HandleState
     public function startedAt(): float
     {
         return $this->startedAt;
+    }
+
+    public function joinMulti(MultiProgress $multi): void
+    {
+        $this->multi = $multi;
+        $this->addedAtExec = $multi->execs();
+    }
+
+    /**
+     * Where the multi transfer had got, as far as curl_multi_exec() said.
+     *
+     * @return 'unstarted'|'running'|'finished'|null null when not on a multi handle
+     */
+    public function multiPhase(): ?string
+    {
+        return $this->multi?->phaseOf($this->addedAtExec);
     }
 
     public function correlationId(): ?string

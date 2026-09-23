@@ -7,6 +7,7 @@ namespace Ssx\Wiretap\Auto;
 use Ssx\Wiretap\Auto\Internal\ExchangeFactory;
 use Ssx\Wiretap\Auto\Internal\HandleRegistry;
 use Ssx\Wiretap\Auto\Internal\HandleState;
+use Ssx\Wiretap\Auto\Internal\MultiProgress;
 use Ssx\Wiretap\Contract\HookDriver;
 use Ssx\Wiretap\Correlation;
 use Ssx\Wiretap\Recorder;
@@ -42,6 +43,9 @@ final class OtelHookDriver implements HookDriver
 
     private readonly HandleRegistry $registry;
 
+    /** @var \WeakMap<\CurlMultiHandle, MultiProgress> */
+    private \WeakMap $multis;
+
     /** @var \Closure(): Recorder */
     private readonly \Closure $resolveRecorder;
 
@@ -66,6 +70,10 @@ final class OtelHookDriver implements HookDriver
             : $recorder;
 
         $this->registry = $registry ?? new HandleRegistry();
+
+        /** @var \WeakMap<\CurlMultiHandle, MultiProgress> $multis */
+        $multis = new \WeakMap();
+        $this->multis = $multis;
     }
 
     private function recorder(): Recorder
@@ -355,10 +363,12 @@ final class OtelHookDriver implements HookDriver
     /**
      * Record a finished transfer, if it was one we were capturing.
      *
-     * @param bool $reported whether curl reported how it ended: curl_exec
-     *                       returning, or curl_multi_info_read saying so
+     * @param string $completion ExchangeFactory::REPORTED when curl said how it
+     *                           ended (curl_exec returning, or
+     *                           curl_multi_info_read), otherwise FINISHED or
+     *                           UNFINISHED as far as curl_multi_exec() said
      */
-    private function finishTransfer(mixed $handle, mixed $result, bool $reported = true): void
+    private function finishTransfer(mixed $handle, mixed $result, string $completion = ExchangeFactory::REPORTED): void
     {
         if (!$handle instanceof \CurlHandle || !$this->registry->has($handle)) {
             return;
@@ -384,7 +394,7 @@ final class OtelHookDriver implements HookDriver
             result: $result,
             errno: $errno,
             error: $errno !== 0 ? curl_error($handle) : '',
-            reported: $reported,
+            completion: $completion,
         ));
     }
 
@@ -402,8 +412,8 @@ final class OtelHookDriver implements HookDriver
      * The shape is the same as the synchronous path, just spread out in time:
      * add_handle is where curl_exec's pre would have run, and completion is
      * reported by info_read. remove_handle records a transfer info_read never
-     * reported, as one whose outcome is unknown. finishTransfer() is
-     * idempotent per transfer.
+     * reported, using what curl_multi_exec() said about it. finishTransfer()
+     * is idempotent per transfer.
      */
     private function hookMulti(): void
     {
@@ -413,7 +423,24 @@ final class OtelHookDriver implements HookDriver
                 return;
             }
 
-            $this->beginTransfer($params[1] ?? null);
+            $multi = $params[0] ?? null;
+            $handle = $params[1] ?? null;
+
+            $this->beginTransfer($handle);
+
+            if ($multi instanceof \CurlMultiHandle && $handle instanceof \CurlHandle && $this->registry->has($handle)) {
+                $this->registry->for($handle)->joinMulti($this->progressOf($multi));
+            }
+        });
+
+        // Only to read still_running, which the post hook sees as curl set
+        // it. Nothing is called on the multi handle.
+        $this->hook('curl_multi_exec', post: function (mixed $obj, array $params): void {
+            $multi = $params[0] ?? null;
+
+            if ($multi instanceof \CurlMultiHandle) {
+                $this->progressOf($multi)->executed($params[1] ?? null);
+            }
         });
 
         // The application asking which transfers finished is the earliest
@@ -437,21 +464,52 @@ final class OtelHookDriver implements HookDriver
         // the handle leaves the stack, while its info is still readable.
         //
         // Removal is also how a transfer is cancelled — Guzzle's cancel(), a
-        // Symfony response destroyed early, a loop giving up on a timeout —
-        // and nothing here can tell that apart from one that finished: curl
-        // reports the outcome only through info_read, so curl_errno() is 0
-        // even for a transfer curl timed out. Such a transfer is recorded,
-        // because the request was made, but as a failure with no response
-        // body, never as a success.
+        // Symfony response destroyed early, a loop giving up — and curl
+        // reports how a transfer ended only through info_read: curl_errno()
+        // is 0 here even for one curl timed out. So what curl_multi_exec()
+        // said decides it:
+        //
+        //   never executed  nothing was sent; no record, as for a request
+        //                   that was never made
+        //   finished        a loop that ran until nothing was running and
+        //                   removed its handles, like PHP's manual example
+        //                   and many SDKs; recorded, with the outcome read
+        //                   from its info (ExchangeFactory::FINISHED)
+        //   still running   cancelled; a failure with no response body
         $this->hook('curl_multi_remove_handle', pre: function (mixed $obj, array $params): void {
             $handle = $params[1] ?? null;
 
-            if (!$handle instanceof \CurlHandle) {
+            if (!$handle instanceof \CurlHandle || !$this->registry->has($handle)) {
                 return;
             }
 
-            $this->finishTransfer($handle, false, reported: false);
+            $state = $this->registry->for($handle);
+
+            if (!$state->isCapturing()) {
+                return;
+            }
+
+            $phase = $state->multiPhase();
+
+            if ($phase === 'unstarted') {
+                $state->endTransfer();
+
+                return;
+            }
+
+            if ($phase === 'finished') {
+                $this->finishTransfer($handle, $this->multiContent($handle), ExchangeFactory::FINISHED);
+
+                return;
+            }
+
+            $this->finishTransfer($handle, false, ExchangeFactory::UNFINISHED);
         });
+    }
+
+    private function progressOf(\CurlMultiHandle $multi): MultiProgress
+    {
+        return $this->multis[$multi] ??= new MultiProgress();
     }
 
     /**
