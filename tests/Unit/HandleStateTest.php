@@ -61,18 +61,14 @@ describe('request body reconstruction', function (): void {
     });
 });
 
-describe('the HEADER_OUT and VERBOSE conflict', function (): void {
-    it('allows HEADER_OUT when the application did not ask for verbose', function (): void {
-        expect((new HandleState())->canUseHeaderOut())->toBeTrue();
-    });
-
-    it('stands down when the application set VERBOSE', function (): void {
-        // The two share one libcurl debug slot: setting ours silently blanks
-        // theirs, with no warning. Their output is theirs.
+describe('configured request headers', function (): void {
+    it('reports what curl sends for removal and empty-value forms', function (): void {
+        // `Accept:` tells curl not to send its own Accept at all, and
+        // `X-Empty;` sends X-Empty with no value.
         $state = new HandleState();
-        $state->set(CURLOPT_VERBOSE, true);
+        $state->set(CURLOPT_HTTPHEADER, ['Accept:', 'X-Empty;', 'X-Tenant: alpha']);
 
-        expect($state->canUseHeaderOut())->toBeFalse();
+        expect($state->requestHeaderLines())->toBe(['X-Empty:', 'X-Tenant: alpha']);
     });
 });
 

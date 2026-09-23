@@ -96,13 +96,21 @@ streaming to stdout or a file handle, and switching it changes where the
 response goes. The body is recorded as `omitted: not-returned` instead. A
 missing body is a bug report; a corrupted download is an incident.
 
-**It does not set `CURLINFO_HEADER_OUT` when the application set
-`CURLOPT_VERBOSE`.** The two occupy the same libcurl debug slot and setting one
-silently blanks the other, with no warning and no error
-([bug 65348](https://bugs.php.net/bug.php?id=65348)). If you asked for verbose
-output, you keep it, and wiretap falls back to the headers you configured.
+**It does not set `CURLINFO_HEADER_OUT`.** That option makes curl keep the
+request headers it sent, and hands them to anything that calls
+`curl_getinfo()` — Authorization included. Guzzle copies them into handler
+stats and exception context, so they reach logs and error trackers. It also
+shares libcurl's debug slot with `CURLOPT_VERBOSE`, silently blanking verbose
+output ([bug 65348](https://bugs.php.net/bug.php?id=65348)). The record carries
+the headers the application configured instead, with
+`context.request_headers = "configured"`: libcurl's own additions such as
+`Host` are not in it. If the application turned `CURLINFO_HEADER_OUT` on
+itself, the headers actually sent are used.
 
-An application's `CURLOPT_HEADERFUNCTION` is chained, never replaced.
+An application's `CURLOPT_HEADERFUNCTION` is chained, never replaced. If it
+is a private or protected method, which curl accepts from the application's
+scope but wiretap cannot call from its own, the transfer is not captured
+rather than have its callback dropped.
 
 ## Requirements
 

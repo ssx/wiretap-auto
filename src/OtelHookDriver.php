@@ -245,11 +245,15 @@ final class OtelHookDriver implements HookDriver
             && !$state->isUnsafe()
             && $this->recorder()->shouldCapture($url);
 
-        $state->beginTransfer($capture);
-
+        // Without our header wrapper there is no Content-Type to gate the body
+        // on and no headers to record, so a transfer we cannot wrap is one we
+        // cannot record truthfully. It is declined, and the handle is left
+        // exactly as the application configured it.
         if ($capture) {
-            $this->installCaptureOptions($handle, $state);
+            $capture = $this->installCaptureOptions($handle, $state);
         }
+
+        $state->beginTransfer($capture);
     }
 
     /**
@@ -357,31 +361,56 @@ final class OtelHookDriver implements HookDriver
     }
 
     /**
-     * Turn on the two options we need, without taking anything away from the
-     * application.
+     * Install our header callback, without taking anything away from the
+     * application. Returns whether header capture is in place.
+     *
+     * CURLINFO_HEADER_OUT is deliberately not turned on. It would give us the
+     * exact request headers, but it gives them to the application too:
+     * curl_getinfo() then carries them in plaintext, Authorization included,
+     * and Guzzle copies that into handler stats and exception context, from
+     * where it reaches logs and error trackers. It also shares libcurl's
+     * debug slot with CURLOPT_VERBOSE, so verbose output an application
+     * turned on after our first capture never appeared. The record uses the
+     * headers the application configured instead, and says so.
      */
-    private function installCaptureOptions(\CurlHandle $handle, HandleState $state): void
+    private function installCaptureOptions(\CurlHandle $handle, HandleState $state): bool
     {
         if ($state->headersInstalled()) {
-            return;
+            return true;
+        }
+
+        $appCallback = null;
+
+        if ($state->hasAppHeaderFunction()) {
+            $appCallback = $state->appHeaderFunction();
+
+            // curl checked this callback from the application's scope, where
+            // a private or protected method is perfectly callable. From ours
+            // it is not, and a wrapper that cannot call it would silently
+            // stop the application's own callback from running.
+            if (!is_callable($appCallback)) {
+                return false;
+            }
         }
 
         $this->applyingOptions = true;
 
         try {
-            // CURLINFO_HEADER_OUT and CURLOPT_VERBOSE share one libcurl debug
-            // slot — setting ours would silently blank theirs. If they asked
-            // for verbose output, they keep it and we fall back to the
-            // shadowed HTTPHEADER lines.
-            if ($state->canUseHeaderOut()) {
-                curl_setopt($handle, CURLINFO_HEADER_OUT, true);
-            }
-
-            $appCallback = $state->appHeaderFunction();
             $appStream = $state->appHeaderStream();
+            $registry = $this->registry;
 
-            curl_setopt($handle, CURLOPT_HEADERFUNCTION, function ($ch, string $line) use ($state, $appCallback, $appStream): int {
-                $state->appendResponseHeader($line);
+            // Static, and holding neither the state nor the handle: this
+            // closure lives on the handle, and curl_copy_handle() gives the
+            // copy the same one. The handle curl passes in says whose
+            // transfer the line belongs to.
+            curl_setopt($handle, CURLOPT_HEADERFUNCTION, static function ($ch, string $line) use ($registry, $appCallback, $appStream): int {
+                if ($ch instanceof \CurlHandle && $registry->has($ch)) {
+                    $current = $registry->for($ch);
+
+                    if ($current->isCapturing()) {
+                        $current->appendResponseHeader($line);
+                    }
+                }
 
                 // Chain, never replace. Returning anything but the byte count
                 // aborts the transfer, so the application's return value wins
@@ -402,8 +431,11 @@ final class OtelHookDriver implements HookDriver
             });
 
             $state->markHeadersInstalled();
+
+            return true;
         } catch (\Throwable) {
             // Instrumentation must never change application behaviour.
+            return false;
         } finally {
             $this->applyingOptions = false;
         }

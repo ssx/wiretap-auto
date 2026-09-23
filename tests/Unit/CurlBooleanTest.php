@@ -44,24 +44,6 @@ describe('curl boolean normalisation', function (): void {
 
         expect($state->returnsTransfer())->toBeTrue();
     });
-
-    it('leaves CURLINFO_HEADER_OUT alone when verbose is on as an integer', function (): void {
-        // The two share one libcurl debug slot. A strict !== true check read
-        // `CURLOPT_VERBOSE => 1` as off, so wiretap claimed the slot and the
-        // application's verbose output silently stopped — diagnostics it had
-        // explicitly asked for.
-        $state = new HandleState();
-        $state->set(CURLOPT_VERBOSE, 1);
-
-        expect($state->canUseHeaderOut())->toBeFalse();
-    });
-
-    it('still uses CURLINFO_HEADER_OUT when verbose is off', function (): void {
-        $state = new HandleState();
-        $state->set(CURLOPT_VERBOSE, 0);
-
-        expect($state->canUseHeaderOut())->toBeTrue();
-    });
 });
 
 describe('the application header destination', function (): void {
