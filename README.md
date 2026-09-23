@@ -147,11 +147,16 @@ WIRETAP_PATH=/var/log/wiretap        # default: system temp
 WIRETAP_BODY_LIMIT=65536
 WIRETAP_SAMPLE_BP=10000              # basis points; 10000 = keep everything
 WIRETAP_BLOCK=api.internal.test,*.acquirer.test
+WIRETAP_REDACT=false                 # store plaintext; default on (core v0.0.19+)
 WIRETAP_DISABLE_AUTO=true            # skip hook registration entirely
 ```
 
 A package that started recording personal data the moment it was installed
 would be indefensible, so capture is off unless `WIRETAP_ENABLED` is truthy.
+
+Redaction is the other way round: on unless `WIRETAP_REDACT` is an
+unmistakable false (`false`, `0`, `off` or `no`, any case). Unset, empty or a
+typo leaves it on, so a misspelling never stores credentials in plaintext.
 
 The `payment-gateways` and `cloud-metadata` blocklist presets are on by
 default. Cloud metadata endpoints hand out short-lived IAM credentials;
