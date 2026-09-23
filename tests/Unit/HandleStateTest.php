@@ -120,23 +120,20 @@ describe('the registry', function (): void {
         $a = new stdClass();
         $b = new stdClass();
 
-        $registry->for($a)->set(CURLOPT_URL, 'https://a.example.com');
-        $registry->for($b)->set(CURLOPT_URL, 'https://b.example.com');
+        $registry->track($a)->set(CURLOPT_URL, 'https://a.example.com');
+        $registry->track($b)->set(CURLOPT_URL, 'https://b.example.com');
 
-        expect($registry->for($a)->url())->toBe('https://a.example.com')
-            ->and($registry->for($b)->url())->toBe('https://b.example.com')
+        expect($registry->track($a)->url())->toBe('https://a.example.com')
+            ->and($registry->track($b)->url())->toBe('https://b.example.com')
             ->and($registry->count())->toBe(2);
     });
 
-    it('forgets a closed handle', function (): void {
+    it('does not invent a state for a handle it never saw created', function (): void {
         $registry = new HandleRegistry();
         $handle = new stdClass();
 
-        $registry->for($handle);
-        $registry->forget($handle);
-
-        expect($registry->has($handle))->toBeFalse()
-            ->and($registry->count())->toBe(0);
+        expect($registry->for($handle)->isUnsafe())->toBeTrue()
+            ->and($registry->has($handle))->toBeFalse();
     });
 
     it('duplicates state for a copied handle', function (): void {
@@ -144,10 +141,10 @@ describe('the registry', function (): void {
         $from = new stdClass();
         $to = new stdClass();
 
-        $registry->for($from)->set(CURLOPT_URL, 'https://api.example.com');
+        $registry->track($from)->set(CURLOPT_URL, 'https://api.example.com');
         $registry->copy($from, $to);
 
-        expect($registry->for($to)->url())->toBe('https://api.example.com');
+        expect($registry->track($to)->url())->toBe('https://api.example.com');
     });
 
     it('does not grow without bound when handles leak', function (): void {
@@ -156,7 +153,7 @@ describe('the registry', function (): void {
         $registry = new HandleRegistry(maxHandles: 10);
 
         for ($i = 0; $i < 50; ++$i) {
-            $registry->for(new stdClass());
+            $registry->track(new stdClass());
         }
 
         expect($registry->count())->toBeLessThanOrEqual(10);
@@ -229,7 +226,7 @@ describe('the registry holding handles weakly', function (): void {
         // callbacks and shadowed POST body, until the process ended.
         $registry = new HandleRegistry();
         $handle = new stdClass();
-        $registry->for($handle)->set(CURLOPT_URL, 'https://api.example.com');
+        $registry->track($handle)->set(CURLOPT_URL, 'https://api.example.com');
         $weak = WeakReference::create($handle);
 
         expect($registry->count())->toBe(1);
@@ -245,7 +242,7 @@ describe('the registry holding handles weakly', function (): void {
         // grew without bound regardless of the cap.
         $registry = new HandleRegistry(maxHandles: 4);
         $source = new stdClass();
-        $registry->for($source);
+        $registry->track($source);
 
         $held = [];
 

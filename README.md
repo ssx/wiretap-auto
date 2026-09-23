@@ -85,9 +85,9 @@ uses it to observe the whole curl handle lifecycle:
 | `curl_init` | register the handle, capture a URL passed to the constructor |
 | `curl_setopt`, `curl_setopt_array` | curl options are **write-only** — there is no `curl_getopt()`, so the only way to know a handle's URL or POSTFIELDS is to watch every call go past |
 | `curl_copy_handle` | a copied handle inherits the options, so the shadow state must be copied too |
-| `curl_reset` | returns the handle to defaults |
+| `curl_reset` | returns the handle to defaults, and is the one way a handle whose options are unknown becomes capturable again |
 | `curl_exec` | pre: run the blocklist gate and install capture options. post: the return value **is** the response body |
-| `curl_close` | release the shadow state |
+| `curl_close` | not hooked: since PHP 8 it does nothing and the handle stays usable, so the shadow state lives until the handle is destroyed |
 
 ### Two things it deliberately does not do
 

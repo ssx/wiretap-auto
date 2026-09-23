@@ -361,3 +361,135 @@ it('still calls a private header callback, and declines capture rather than drop
         // to write, so there is none.
         ->and($this->sink->all())->toBeEmpty();
 });
+
+it('keeps modelling a handle the application goes on using after curl_close', function (): void {
+    // On PHP 8 curl_close() does nothing: the handle stays usable with every
+    // option intact. Forgetting its state there made CURLOPT_HEADER look off,
+    // so the next response was recorded with its headers inside the body,
+    // where header redaction never looks.
+    $recorder = useRecorder($this->sink);
+
+    $ch = curl_init('http://127.0.0.1:' . TEST_SERVER_PORT . '/before-close');
+    curl_setopt_array($ch, [CURLOPT_HEADER => true, CURLOPT_RETURNTRANSFER => true]);
+    curl_exec($ch);
+    curl_close($ch);
+    curl_setopt($ch, CURLOPT_URL, 'http://127.0.0.1:' . TEST_SERVER_PORT . '/after-close');
+    $out = curl_exec($ch);
+    $recorder->flush();
+
+    $after = $this->sink->all()[1];
+
+    expect($out)->toStartWith('HTTP/')
+        ->and($after->uri)->toContain('/after-close')
+        ->and($after->responseBody->bytes)->toBeNull()
+        ->and($after->responseBody->omittedReason)->toBe(Ssx\Wiretap\CapturedBody::OMITTED_NOT_READABLE);
+});
+
+it('keeps a copy of an unmodellable handle unmodellable', function (): void {
+    // curl_copy_handle() copies whatever a failed curl_setopt_array() had
+    // already applied, CURLOPT_HEADER included. The copy's shadow lost the
+    // unsafe mark, so it was captured with the headers inside the body.
+    $recorder = useRecorder($this->sink);
+
+    $ch = curl_init('http://127.0.0.1:' . TEST_SERVER_PORT . '/unsafe');
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+
+    try {
+        curl_setopt_array($ch, [CURLOPT_HEADER => true, 999999 => 1]);
+    } catch (\ValueError) {
+        // Applied HEADER, then refused the bogus option.
+    }
+
+    $copy = curl_copy_handle($ch);
+    $out = curl_exec($copy);
+    $recorder->flush();
+
+    expect($out)->toStartWith('HTTP/')
+        ->and($this->sink->all())->toBeEmpty();
+});
+
+it('does not trust a handle it first saw while the registry was full', function (): void {
+    // A handle configured while the registry was at capacity had its options
+    // thrown away. Once capacity came back it was given a fresh, blank state
+    // that believed CURLOPT_HEADER was off.
+    $recorder = useRecorder($this->sink);
+
+    $fill = [];
+
+    for ($i = 0; $i < 1024; ++$i) {
+        $fill[] = curl_init('http://127.0.0.1:1/');
+    }
+
+    $ch = curl_init();
+    curl_setopt_array($ch, [CURLOPT_HEADER => true, CURLOPT_RETURNTRANSFER => true]);
+
+    $fill = [];
+    gc_collect_cycles();
+
+    curl_setopt($ch, CURLOPT_URL, 'http://127.0.0.1:' . TEST_SERVER_PORT . '/after-capacity');
+    $out = curl_exec($ch);
+    $recorder->flush();
+
+    expect($out)->toStartWith('HTTP/')
+        ->and($this->sink->all())->toBeEmpty();
+});
+
+it('reads CURLOPT_HEADER as curl does when it is given an array', function (): void {
+    // ext-curl converts the value with its integer cast, and a non-empty
+    // array is 1. Reading it as off put the headers in the recorded body.
+    $recorder = useRecorder($this->sink);
+
+    $ch = curl_init('http://127.0.0.1:' . TEST_SERVER_PORT . '/array-header');
+    curl_setopt_array($ch, [CURLOPT_HEADER => [1], CURLOPT_RETURNTRANSFER => true]);
+    $out = curl_exec($ch);
+    $recorder->flush();
+
+    expect($out)->toStartWith('HTTP/')
+        ->and($this->sink->all()[0]->responseBody->bytes)->toBeNull();
+});
+
+it('keeps capturing headers when the application sets CURLOPT_WRITEHEADER after a capture', function (): void {
+    // WRITEHEADER switches curl's header handler to the file, which bypasses
+    // our wrapper. The next record had no headers, and a body with no
+    // Content-Type slips past the binary-body gate.
+    $recorder = useRecorder($this->sink);
+
+    $ch = curl_init('http://127.0.0.1:' . TEST_SERVER_PORT . '/first');
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_exec($ch);
+
+    $file = fopen('php://temp', 'w+');
+    curl_setopt($ch, CURLOPT_WRITEHEADER, $file);
+    curl_setopt($ch, CURLOPT_URL, 'http://127.0.0.1:' . TEST_SERVER_PORT . '/second');
+    curl_exec($ch);
+    rewind($file);
+    $recorder->flush();
+
+    expect((string) stream_get_contents($file))->toContain('Content-Type')
+        ->and($this->sink->all()[1]->responseHeaders->first('Content-Type'))->toBe('application/json');
+});
+
+it('honours whichever of HEADERFUNCTION and WRITEHEADER was set last', function (): void {
+    // In ext-curl the later of the two decides where headers go. With the
+    // callback set first and a file second, the file gets the headers and the
+    // callback is never called — wiretap had it the other way round.
+    $recorder = useRecorder($this->sink);
+    $calls = 0;
+
+    $ch = curl_init('http://127.0.0.1:' . TEST_SERVER_PORT . '/order');
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HEADERFUNCTION, static function ($ch, string $line) use (&$calls): int {
+        ++$calls;
+
+        return strlen($line);
+    });
+    $file = fopen('php://temp', 'w+');
+    curl_setopt($ch, CURLOPT_WRITEHEADER, $file);
+    curl_exec($ch);
+    rewind($file);
+    $recorder->flush();
+
+    expect($calls)->toBe(0)
+        ->and((string) stream_get_contents($file))->toContain('Content-Type')
+        ->and($this->sink->all()[0]->responseHeaders->has('Content-Type'))->toBeTrue();
+});
