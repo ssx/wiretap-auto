@@ -34,7 +34,11 @@ final class HandleRegistry
         $this->handles = $map;
     }
 
-    public function for(object $handle): HandleState
+    /**
+     * Start tracking a handle whose options are known: one curl_init() has
+     * just created, or curl_reset() has just returned to defaults.
+     */
+    public function track(object $handle): HandleState
     {
         if ($this->handles->offsetExists($handle)) {
             return $this->handles[$handle];
@@ -50,7 +54,26 @@ final class HandleRegistry
     }
 
     /**
-     * A throwaway state for a handle we have declined to track.
+     * The state of a tracked handle.
+     *
+     * A handle we did not see created is never given a fresh state here. It
+     * used to be: one configured while the registry was full had those
+     * options thrown away, and once capacity came back it was tracked from a
+     * blank state that believed CURLOPT_HEADER was off, so its response
+     * headers were recorded inside the body. Its options are unknown, so it
+     * stays declined until curl_reset() makes them known again.
+     */
+    public function for(object $handle): HandleState
+    {
+        if ($this->handles->offsetExists($handle)) {
+            return $this->handles[$handle];
+        }
+
+        return $this->untracked();
+    }
+
+    /**
+     * A throwaway state for a handle we are not tracking.
      *
      * At capacity the registry used to clear itself, which discarded the state
      * of handles that were still live and still instrumented. Their recorded
@@ -69,7 +92,7 @@ final class HandleRegistry
     private function untracked(): HandleState
     {
         $state = new HandleState();
-        $state->markUnsafe('handle registry is at capacity; this handle is not tracked');
+        $state->markUnsafe('handle is not tracked, so its options are unknown');
 
         return $state;
     }
@@ -96,13 +119,6 @@ final class HandleRegistry
         }
 
         $this->handles[$to] = $copied;
-    }
-
-    public function forget(object $handle): void
-    {
-        if ($this->handles->offsetExists($handle)) {
-            $this->handles->offsetUnset($handle);
-        }
     }
 
     public function count(): int

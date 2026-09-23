@@ -103,7 +103,7 @@ final class OtelHookDriver implements HookDriver
                 return;
             }
 
-            $state = $this->registry->for($handle);
+            $state = $this->registry->track($handle);
 
             // curl_init($url) is the one-argument form.
             if (isset($params[0]) && is_string($params[0])) {
@@ -179,17 +179,19 @@ final class OtelHookDriver implements HookDriver
             }
         });
 
+        // After a reset the handle's options are the defaults, so a handle we
+        // were not tracking becomes one we can.
         $this->hook('curl_reset', pre: function (mixed $obj, array $params): void {
             if (($params[0] ?? null) instanceof \CurlHandle) {
-                $this->registry->for($params[0])->reset();
+                $this->registry->track($params[0])->reset();
             }
         });
 
-        $this->hook('curl_close', pre: function (mixed $obj, array $params): void {
-            if (($params[0] ?? null) instanceof \CurlHandle) {
-                $this->registry->forget($params[0]);
-            }
-        });
+        // curl_close() is deliberately not hooked. Since PHP 8 it does
+        // nothing: the handle stays usable with every option intact, and
+        // forgetting its state there made the next transfer look like a blank
+        // handle — CURLOPT_HEADER off, so headers recorded inside the body.
+        // The WeakMap drops the state when the handle is actually destroyed.
     }
 
     private function hookExec(): void
