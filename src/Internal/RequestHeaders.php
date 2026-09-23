@@ -76,8 +76,13 @@ final class RequestHeaders
             $lines[] = 'Cookie: ' . $cookie;
         }
 
+        // For an array body curl appends its own random boundary to the
+        // application's Content-Type, so the line it sent is not the one
+        // given, and it is left out like the rest of the multipart headers.
+        $multipart = $state->bodySource() === 'multipart';
+
         foreach ($custom as $line) {
-            if (stripos($line, 'host:') !== 0) {
+            if (stripos($line, 'host:') !== 0 && !($multipart && stripos($line, 'content-type:') === 0)) {
                 $lines[] = $line;
             }
         }
@@ -93,7 +98,7 @@ final class RequestHeaders
                 $lines[] = 'Content-Length: ' . $length;
             }
 
-            if ($mine('Content-Type') && is_string($state->get(CURLOPT_POSTFIELDS)) && $state->method() !== 'HEAD') {
+            if ($mine('Content-Type') && $state->sentPostString() !== null) {
                 $lines[] = 'Content-Type: application/x-www-form-urlencoded';
             }
         }
@@ -340,25 +345,18 @@ final class RequestHeaders
      */
     private static function contentLength(HandleState $state): ?int
     {
-        if ($state->method() === 'HEAD') {
-            return null;
+        $body = $state->sentPostString();
+
+        if ($body !== null) {
+            return strlen($body);
         }
 
-        $fields = $state->get(CURLOPT_POSTFIELDS);
-
-        // An array is sent as multipart, whose boundary curl makes up.
-        if (is_string($fields)) {
-            return strlen($fields);
-        }
-
-        if ($fields !== null) {
-            return null;
-        }
-
+        // A PUT reads its body from the callback and declares INFILESIZE. A
+        // POST reading from one is sent chunked, and an array body as
+        // multipart, whose boundary curl makes up.
         $size = $state->get(CURLOPT_INFILESIZE);
 
-        if ((HandleState::curlBool($state->get(CURLOPT_UPLOAD)) || HandleState::curlBool($state->get(CURLOPT_PUT)))
-            && is_int($size) && $size >= 0) {
+        if ($state->bodySource() === 'read' && $state->method() === 'PUT' && is_int($size) && $size >= 0) {
             return $size;
         }
 
