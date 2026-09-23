@@ -34,7 +34,8 @@
     "repositories": [
         {
             "type": "vcs",
-            "url": "https://github.com/ssx/wiretap"
+            "url": "https://github.com/ssx/wiretap",
+            "no-api": true
         }
     ],
     "autoload": {

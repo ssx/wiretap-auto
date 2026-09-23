@@ -61,7 +61,7 @@ jobs:
           exit 0
 
       - name: Install dependencies
-        run: composer update --prefer-dist --no-interaction --no-progress ${{ matrix.symfony && format('--with=symfony/http-client:^{0}', matrix.symfony) || '' }}
+        run: for attempt in 1 2 3; do composer update --prefer-dist --no-interaction --no-progress ${{ matrix.symfony && format('--with=symfony/http-client:^{0}', matrix.symfony) || '' }} && break || { [ "$attempt" = 3 ] && exit 1; echo "composer failed, retrying in 15s"; sleep 15; }; done
 
       - name: Run tests
         run: vendor/bin/pest
@@ -80,7 +80,7 @@ jobs:
           coverage: none
 
       - name: Install dependencies
-        run: composer update --prefer-dist --no-interaction --no-progress
+        run: for attempt in 1 2 3; do composer update --prefer-dist --no-interaction --no-progress && break || { [ "$attempt" = 3 ] && exit 1; echo "composer failed, retrying in 15s"; sleep 15; }; done
 
       - name: Analyse
         run: vendor/bin/phpstan analyse --no-progress
