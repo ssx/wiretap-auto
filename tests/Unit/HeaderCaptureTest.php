@@ -110,16 +110,16 @@ describe('registry capacity', function (): void {
         for ($i = 0; $i < 3; ++$i) {
             $handle = curl_init("https://example.test/{$i}");
             $live[] = $handle;
-            $registry->for($handle)->set(CURLOPT_HEADERFUNCTION, static fn ($ch, string $l): int => strlen($l));
+            $registry->track($handle)->set(CURLOPT_HEADERFUNCTION, static fn ($ch, string $l): int => strlen($l));
         }
 
         $overflow = curl_init('https://example.test/overflow');
-        $state = $registry->for($overflow);
+        $state = $registry->track($overflow);
 
         expect($state->isUnsafe())->toBeTrue()
             ->and($registry->has($overflow))->toBeFalse()
             ->and($registry->count())->toBe(3)
-            ->and($registry->for($live[0])->hasAppHeaderFunction())->toBeTrue();
+            ->and($registry->track($live[0])->hasAppHeaderFunction())->toBeTrue();
     });
 
     it('takes new handles again once the application has finished with others', function (): void {
@@ -127,27 +127,27 @@ describe('registry capacity', function (): void {
 
         $first = curl_init('https://example.test/1');
         $second = curl_init('https://example.test/2');
-        $registry->for($first);
-        $registry->for($second);
+        $registry->track($first);
+        $registry->track($second);
 
-        expect($registry->for(curl_init('https://example.test/3'))->isUnsafe())->toBeTrue();
+        expect($registry->track(curl_init('https://example.test/3'))->isUnsafe())->toBeTrue();
 
         unset($first, $second);
         gc_collect_cycles();
 
-        expect($registry->for(curl_init('https://example.test/4'))->isUnsafe())->toBeFalse();
+        expect($registry->track(curl_init('https://example.test/4'))->isUnsafe())->toBeFalse();
     });
 
     it('declines a copy at capacity instead of evicting', function (): void {
         $registry = new HandleRegistry(maxHandles: 1);
 
         $source = curl_init('https://example.test/source');
-        $registry->for($source)->set(CURLOPT_HEADERFUNCTION, static fn ($ch, string $l): int => strlen($l));
+        $registry->track($source)->set(CURLOPT_HEADERFUNCTION, static fn ($ch, string $l): int => strlen($l));
 
         $copy = curl_init('https://example.test/copy');
         $registry->copy($source, $copy);
 
         expect($registry->has($copy))->toBeFalse()
-            ->and($registry->for($source)->hasAppHeaderFunction())->toBeTrue();
+            ->and($registry->track($source)->hasAppHeaderFunction())->toBeTrue();
     });
 });

@@ -51,6 +51,16 @@ final class HandleState
      */
     private ?CallbackRef $appHeaderFunction = null;
 
+    /**
+     * Where curl sends response headers: 'callback', 'file' or null.
+     *
+     * In ext-curl CURLOPT_HEADERFUNCTION and CURLOPT_WRITEHEADER each switch
+     * the header handler to themselves, so whichever was set last wins. This
+     * was modelled as the callback always winning, which had curl writing to
+     * the file while wiretap called the callback.
+     */
+    private ?string $headerTarget = null;
+
     public function set(int $option, mixed $value): void
     {
         // Callbacks and other objects are recorded as present, never held.
@@ -64,12 +74,21 @@ final class HandleState
         // onto it rather than silently replacing it.
         if ($option === CURLOPT_HEADERFUNCTION) {
             $this->appHeaderFunction = $value === null ? null : CallbackRef::of($value);
+            $this->headerTarget = $value === null ? null : 'callback';
 
             // The application replaced the callback on a reused handle, which
             // removed our wrapper. Without this, headersInstalled stayed true
             // and every later response on that handle was recorded with no
             // headers at all — and a body with no content type slips past the
             // redactor's binary gate.
+            $this->headersInstalled = false;
+        }
+
+        // Setting it, to a stream or to null, moves curl's header handler off
+        // our wrapper just as replacing the callback does. Without this the
+        // next response on the handle was recorded with no headers at all.
+        if ($option === CURLOPT_WRITEHEADER) {
+            $this->headerTarget = is_resource($value) ? 'file' : null;
             $this->headersInstalled = false;
         }
 
@@ -214,7 +233,14 @@ final class HandleState
             return (int) $value !== 0;
         }
 
-        return false;
+        // The same cast gives 1 for a non-empty array and for a resource.
+        // Reading `CURLOPT_HEADER => [1]` as off put the response headers in
+        // the recorded body. Objects are shadowed as `true` before this.
+        if (is_array($value)) {
+            return $value !== [];
+        }
+
+        return is_resource($value);
     }
 
     /**
@@ -354,7 +380,7 @@ final class HandleState
      */
     public function hasAppHeaderFunction(): bool
     {
-        return $this->appHeaderFunction !== null;
+        return $this->headerTarget === 'callback' && $this->appHeaderFunction !== null;
     }
 
     /**
@@ -364,7 +390,7 @@ final class HandleState
      */
     public function appHeaderFunction(): mixed
     {
-        return $this->appHeaderFunction?->resolve();
+        return $this->headerTarget === 'callback' ? $this->appHeaderFunction?->resolve() : null;
     }
 
     /**
@@ -381,9 +407,9 @@ final class HandleState
      */
     public function appHeaderStream()
     {
-        if ($this->appHeaderFunction !== null) {
-            // A callback wins over WRITEHEADER in curl, so there is no
-            // destination for us to stand in for.
+        if ($this->headerTarget !== 'file') {
+            // A callback set after it wins over WRITEHEADER in curl, so there
+            // is no destination for us to stand in for.
             return null;
         }
 
@@ -508,12 +534,24 @@ final class HandleState
     /**
      * curl_copy_handle() duplicates the options, so the shadow must be
      * duplicated too or the copy looks like a blank handle.
+     *
+     * That includes what we know we do not know. A copy of a handle whose
+     * options are unknown has the same unknown options, and dropping the mark
+     * let a copy of a half-applied curl_setopt_array() be captured with its
+     * response headers inside the body.
+     *
+     * curl copies our header wrapper to the copy as well. It works out whose
+     * transfer a line belongs to from the handle curl passes it, so it is as
+     * installed on the copy as on the source.
      */
     public function copy(): self
     {
         $copy = new self();
         $copy->options = $this->options;
         $copy->appHeaderFunction = $this->appHeaderFunction;
+        $copy->headerTarget = $this->headerTarget;
+        $copy->headersInstalled = $this->headersInstalled;
+        $copy->unsafeReason = $this->unsafeReason;
 
         return $copy;
     }
@@ -525,6 +563,7 @@ final class HandleState
     {
         $this->options = [];
         $this->appHeaderFunction = null;
+        $this->headerTarget = null;
         $this->responseHeaderBuffer = '';
         $this->currentHeaderBlock = '';
         $this->headersTruncated = false;
