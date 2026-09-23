@@ -458,8 +458,11 @@ final class OtelHookDriver implements HookDriver
      * and Guzzle copies that into handler stats and exception context, from
      * where it reaches logs and error trackers. It also shares libcurl's
      * debug slot with CURLOPT_VERBOSE, so verbose output an application
-     * turned on after our first capture never appeared. The record uses the
-     * headers the application configured instead, and says so.
+     * turned on after our first capture never appeared. The record rebuilds
+     * the request headers from the options instead (see RequestHeaders), and
+     * says so. CURLOPT_DEBUGFUNCTION is no way round this on PHP 8.4: with
+     * one installed, PHP stores the sent headers in curl_getinfo() anyway,
+     * and an application's own CURLINFO_HEADER_OUT then throws.
      */
     private function installCaptureOptions(\CurlHandle $handle, HandleState $state): bool
     {

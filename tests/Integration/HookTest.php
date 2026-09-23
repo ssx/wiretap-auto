@@ -78,7 +78,7 @@ it('captures a raw curl_exec with no application changes', function (): void {
         // The headers the application configured, marked as such: libcurl's
         // own additions are only knowable through CURLINFO_HEADER_OUT.
         ->and($exchange->requestHeaders->first('Content-Type'))->toBe('application/json')
-        ->and($exchange->context['request_headers'] ?? null)->toBe('configured')
+        ->and($exchange->context['request_headers'] ?? null)->toBe('reconstructed')
         ->and($exchange->responseHeaders->has('Content-Type'))->toBeTrue()
         ->and($exchange->timings->total)->toBeGreaterThan(0);
 });
@@ -271,10 +271,9 @@ it('does not put request headers where the application can read them', function 
 
     expect(curl_getinfo($ch))->not->toHaveKey('request_header')
         ->and(curl_getinfo($ch, CURLINFO_HEADER_OUT))->toBeFalse()
-        // The record falls back to the headers the application configured,
-        // and says that is what they are.
+        // The record rebuilds them from the options instead, and says so.
         ->and($exchange->requestHeaders->first('X-Tenant'))->toBe('alpha')
-        ->and($exchange->context['request_headers'] ?? null)->toBe('configured');
+        ->and($exchange->context['request_headers'] ?? null)->toBe('reconstructed');
 });
 
 it('keeps Guzzle handler stats free of request headers', function (): void {
@@ -303,7 +302,7 @@ it('uses the sent headers when the application asked curl for them itself', func
     $exchange = $this->sink->all()[0];
 
     expect($exchange->requestHeaders->has('Host'))->toBeTrue()
-        ->and($exchange->context)->not->toHaveKey('request_headers');
+        ->and($exchange->context['request_headers'] ?? null)->toBe('sent');
 });
 
 it('leaves verbose output working when the application turns it on after a capture', function (): void {
