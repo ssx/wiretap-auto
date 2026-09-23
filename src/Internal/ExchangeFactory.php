@@ -17,7 +17,7 @@ use Ssx\Wiretap\TransferError;
  *
  *   request headers   what curl sent, where it told us, otherwise rebuilt
  *                     from the shadowed options (see RequestHeaders)
- *   request body      the shadowed CURLOPT_POSTFIELDS
+ *   request body      the shadowed CURLOPT_POSTFIELDS, as curl sends it
  *   response headers  our chained CURLOPT_HEADERFUNCTION
  *   response body     the curl_exec() return value
  *   timings, errno    curl_getinfo() and curl_errno()
@@ -107,9 +107,12 @@ final readonly class ExchangeFactory
             //
             // transfer_outcome says the outcome was read from the transfer's
             // info rather than from curl, which reports it only to
-            // curl_multi_info_read.
+            // curl_multi_info_read. request_body says the same of an array
+            // body as request_headers does of the headers: curl sent it as
+            // multipart with a random boundary, and the one on record is ours.
             context: ['request_headers' => $sent === null ? 'reconstructed' : 'sent']
-                + ($completion === self::FINISHED ? ['transfer_outcome' => 'inferred'] : []),
+                + ($completion === self::FINISHED ? ['transfer_outcome' => 'inferred'] : [])
+                + ($state->requestBodyIsRebuilt() ? ['request_body' => 'reconstructed'] : []),
         );
     }
 

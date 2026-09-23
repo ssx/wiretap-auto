@@ -83,6 +83,37 @@ final class HandleState
      */
     private ?string $headerTarget = null;
 
+    /**
+     * libcurl's method state, which every method option moves (measured
+     * against libcurl 8): GET, POST (a string body or a read callback),
+     * POST_MIME (an array body, sent as multipart), PUT or HEAD.
+     */
+    private string $httpRequest = 'GET';
+
+    /**
+     * CURLOPT_NOBODY. Separate from the method: a string POSTFIELDS set after
+     * it leaves it on, so the request is still HEAD.
+     */
+    private bool $noBody = false;
+
+    /**
+     * The last string body and the last array body. libcurl keeps both, and
+     * which one is sent depends on the method at the time of the transfer: a
+     * string body survives a switch to GET and is sent again by a later
+     * POST=true, and an array body is not sent by POST=true at all.
+     */
+    private ?string $postString = null;
+
+    /** @var array<array-key, mixed>|true|null true when it holds something unreadable */
+    private array|bool|null $postMime = null;
+
+    /**
+     * The boundary a rebuilt multipart body uses. curl picks a random one per
+     * request, 24 dashes and 22 characters in libcurl 8; this has the same
+     * length, so the rebuilt body is the size of the one sent.
+     */
+    public const MULTIPART_BOUNDARY = '------------------------wiretapreconstructed00';
+
     public function set(int $option, mixed $value): void
     {
         // Callbacks and other objects are recorded as present, never held.
@@ -145,24 +176,73 @@ final class HandleState
             $this->headersInstalled = false;
         }
 
-        // curl treats these as mutually exclusive method switches. Tracking
-        // only the last-set option reported POST with a stale body after the
-        // caller switched back to GET.
-        if ($option === CURLOPT_HTTPGET && self::curlBool($value)) {
-            // NOBODY too. CURLOPT_HTTPGET clears it in curl, so a handle
-            // switched from HEAD back to GET was sending GET while the record
-            // said HEAD — and a HEAD record carries no response body, so the
-            // body of that GET was reported as absent rather than captured.
-            unset(
-                $this->options[CURLOPT_POST],
-                $this->options[CURLOPT_POSTFIELDS],
-                $this->options[CURLOPT_PUT],
-                $this->options[CURLOPT_NOBODY],
-            );
-        }
+        $this->moveMethod($option, $value);
+    }
 
-        if ($option === CURLOPT_POST && self::curlBool($value)) {
-            unset($this->options[CURLOPT_HTTPGET], $this->options[CURLOPT_NOBODY]);
+    /**
+     * libcurl's method state machine, as measured against what a server
+     * receives. Modelling each option on its own recorded a POST the server
+     * saw as a GET after POST=false or NOBODY 1 then 0, and a GET for UPLOAD.
+     */
+    private function moveMethod(int $option, mixed $value): void
+    {
+        switch ($option) {
+            case CURLOPT_POSTFIELDS:
+                // ext-curl sends a non-empty array or an object as multipart
+                // (CURLOPT_MIMEPOST, which also clears NOBODY), and anything
+                // else as a string (COPYPOSTFIELDS, which does not): null and
+                // an empty array become an empty body.
+                if (is_object($value) || (is_array($value) && $value !== [])) {
+                    $shadow = self::shadowValue($value);
+                    $this->postMime = is_array($shadow) ? $shadow : true;
+                    $this->httpRequest = 'POST_MIME';
+                    $this->noBody = false;
+                } else {
+                    $this->postString = is_scalar($value) ? (string) $value : '';
+                    $this->httpRequest = 'POST';
+                }
+
+                break;
+
+            case CURLOPT_POST:
+                if (self::curlBool($value)) {
+                    $this->httpRequest = 'POST';
+                    $this->noBody = false;
+                } else {
+                    $this->httpRequest = 'GET';
+                }
+
+                break;
+
+            case CURLOPT_HTTPGET:
+                if (self::curlBool($value)) {
+                    $this->httpRequest = 'GET';
+                    $this->noBody = false;
+                }
+
+                break;
+
+            case CURLOPT_NOBODY:
+                $this->noBody = self::curlBool($value);
+
+                if ($this->noBody) {
+                    $this->httpRequest = 'HEAD';
+                } elseif ($this->httpRequest === 'HEAD') {
+                    $this->httpRequest = 'GET';
+                }
+
+                break;
+
+            case CURLOPT_UPLOAD:
+            case CURLOPT_PUT:
+                if (self::curlBool($value)) {
+                    $this->httpRequest = 'PUT';
+                    $this->noBody = false;
+                } else {
+                    $this->httpRequest = 'GET';
+                }
+
+                break;
         }
     }
 
@@ -229,22 +309,42 @@ final class HandleState
             return $this->options[CURLOPT_CUSTOMREQUEST];
         }
 
-        // curl accepts 1 as well as true. A strict === true check reported
-        // GET for `curl_setopt($ch, CURLOPT_POST, 1)`, which is the form most
-        // code in the wild uses.
-        if ($this->isOn(CURLOPT_NOBODY)) {
+        if ($this->noBody) {
             return 'HEAD';
         }
 
-        if ($this->isOn(CURLOPT_POST) || isset($this->options[CURLOPT_POSTFIELDS])) {
-            return 'POST';
+        return $this->httpRequest === 'POST_MIME' ? 'POST' : $this->httpRequest;
+    }
+
+    /**
+     * What curl sends as the request body: nothing, the string body, the
+     * array body as multipart, or whatever a read callback or INFILE gives it.
+     *
+     * The method name does not decide this. A custom GET sends the string
+     * body; a custom PATCH after POST=false sends nothing.
+     *
+     * @return 'none'|'string'|'multipart'|'read'
+     */
+    public function bodySource(): string
+    {
+        if ($this->noBody) {
+            return 'none';
         }
 
-        if ($this->isOn(CURLOPT_PUT)) {
-            return 'PUT';
-        }
+        return match ($this->httpRequest) {
+            'POST' => $this->postString !== null ? 'string' : 'read',
+            'POST_MIME' => 'multipart',
+            'PUT' => 'read',
+            default => 'none',
+        };
+    }
 
-        return 'GET';
+    /**
+     * The string body, when that is what curl sends.
+     */
+    public function sentPostString(): ?string
+    {
+        return $this->bodySource() === 'string' ? $this->postString : null;
     }
 
     /**
@@ -306,16 +406,22 @@ final class HandleState
      */
     public function requestContentType(): ?string
     {
-        foreach ($this->requestHeaderLines() as $line) {
-            if (stripos($line, 'content-type:') === 0) {
-                return trim(substr($line, 13));
-            }
+        $source = $this->bodySource();
+        $explicit = $this->explicitContentType();
+
+        // curl sends an array body as multipart, whose boundary it makes up
+        // and appends to the type. The rebuilt body uses its own boundary, so
+        // the type on record is the one that describes the stored bytes.
+        // Reporting it as a form made the record claim a body that was never
+        // sent.
+        if ($source === 'multipart') {
+            return $explicit === null || self::isFormData($explicit)
+                ? 'multipart/form-data; boundary=' . self::MULTIPART_BOUNDARY
+                : $explicit;
         }
 
-        $fields = $this->options[CURLOPT_POSTFIELDS] ?? null;
-
-        if (is_array($fields)) {
-            return 'application/x-www-form-urlencoded';
+        if ($explicit !== null) {
+            return $explicit;
         }
 
         // A string POSTFIELDS with no explicit header is what curl sends as
@@ -324,11 +430,35 @@ final class HandleState
         // to inspect the body and dropped the whole thing — so a form post
         // that could have been recorded with one field redacted was recorded
         // as nothing at all.
-        if (is_string($fields)) {
+        if ($source === 'string' || ($source === 'read' && $this->httpRequest === 'POST')) {
             return 'application/x-www-form-urlencoded';
         }
 
         return null;
+    }
+
+    private function explicitContentType(): ?string
+    {
+        foreach ($this->requestHeaderLines() as $line) {
+            if (stripos($line, 'content-type:') === 0) {
+                return trim(substr($line, 13));
+            }
+        }
+
+        return null;
+    }
+
+    private static function isFormData(string $type): bool
+    {
+        return strtolower(trim(explode(';', $type)[0])) === 'multipart/form-data';
+    }
+
+    /**
+     * Whether the recorded request body is rebuilt rather than the bytes sent.
+     */
+    public function requestBodyIsRebuilt(): bool
+    {
+        return $this->bodySource() === 'multipart' && $this->requestBody() !== null;
     }
 
     /**
@@ -342,33 +472,63 @@ final class HandleState
         return $this->isOn(CURLOPT_HEADER);
     }
 
+    /**
+     * The request body curl sends, where the options determine it.
+     */
     public function requestBody(): ?string
     {
-        $fields = $this->options[CURLOPT_POSTFIELDS] ?? null;
-
-        if (is_string($fields)) {
-            return $fields;
-        }
-
-        // A CURLFile or any other object in the array was recorded as `true`
-        // rather than kept, so an array here holds only plain values.
-        if (is_array($fields)) {
-            return http_build_query($fields);
-        }
-
-        return null;
+        return match ($this->bodySource()) {
+            'string' => $this->postString,
+            'multipart' => $this->multipartBody(),
+            default => null,
+        };
     }
 
     public function requestBodyIsUnreconstructible(): bool
     {
-        $fields = $this->options[CURLOPT_POSTFIELDS] ?? null;
+        return match ($this->bodySource()) {
+            'read' => isset($this->options[CURLOPT_READFUNCTION]) || isset($this->options[CURLOPT_INFILE]),
+            'multipart' => $this->requestBody() === null,
+            default => false,
+        };
+    }
 
-        if ($fields === null) {
-            return isset($this->options[CURLOPT_READFUNCTION])
-                || isset($this->options[CURLOPT_INFILE]);
+    /**
+     * The array body as curl writes it, with our boundary in place of its
+     * random one: one form-data part per field, the name with `"`, CR and LF
+     * percent-encoded, the value as PHP casts it to a string. Measured
+     * against the bytes a server received.
+     *
+     * Null where that is not what curl sends: a CURLFile or other object
+     * (recorded as `true`), a nested array, a name curl would cut at a NUL
+     * byte, or a Content-Type the application set to something other than
+     * form-data, under which curl lays the parts out differently.
+     */
+    private function multipartBody(): ?string
+    {
+        $explicit = $this->explicitContentType();
+
+        if (!is_array($this->postMime) || ($explicit !== null && !self::isFormData($explicit))) {
+            return null;
         }
 
-        return !is_string($fields) && $this->requestBody() === null;
+        $delimiter = '--' . self::MULTIPART_BOUNDARY;
+        $body = '';
+
+        foreach ($this->postMime as $name => $value) {
+            $name = (string) $name;
+
+            if (is_array($value) || str_contains($name, "\0")) {
+                return null;
+            }
+
+            $body .= $delimiter . "\r\n"
+                . 'Content-Disposition: form-data; name="' . strtr($name, ['"' => '%22', "\r" => '%0D', "\n" => '%0A']) . "\"\r\n"
+                . "\r\n"
+                . (is_scalar($value) ? (string) $value : '') . "\r\n";
+        }
+
+        return $body . $delimiter . "--\r\n";
     }
 
     /**
@@ -637,6 +797,10 @@ final class HandleState
         $copy->headerTarget = $this->headerTarget;
         $copy->headersInstalled = $this->headersInstalled;
         $copy->unsafeReason = $this->unsafeReason;
+        $copy->httpRequest = $this->httpRequest;
+        $copy->noBody = $this->noBody;
+        $copy->postString = $this->postString;
+        $copy->postMime = $this->postMime;
         // curl_copy_handle() copies the options the claim arrived with, so
         // the copy is the bridge's transfer too.
         $copy->claimed = $this->claimed;
@@ -657,6 +821,10 @@ final class HandleState
         $this->headersTruncated = false;
         $this->capturing = false;
         $this->headersInstalled = false;
+        $this->httpRequest = 'GET';
+        $this->noBody = false;
+        $this->postString = null;
+        $this->postMime = null;
         // curl_reset puts the handle back to defaults, which is the one thing
         // that can make a divergent shadow state agree again.
         $this->unsafeReason = null;

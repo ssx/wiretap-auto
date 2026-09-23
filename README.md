@@ -149,6 +149,19 @@ redaction like any other header. If the application turned
 `CURLINFO_HEADER_OUT` on itself, the headers actually sent are used and marked
 `"sent"`.
 
+The method and body on record follow libcurl's own method state, which every
+method option moves: `CURLOPT_POST => false` or `NOBODY` set and then cleared
+means GET, `UPLOAD` or `PUT` means PUT, a string `POSTFIELDS` survives a switch
+to GET and is sent again by a later `POST => true`, and `CUSTOMREQUEST`
+renames the method without changing which body goes out. An array
+`POSTFIELDS` is sent as `multipart/form-data`, and is recorded that way: the
+parts as curl writes them, with a boundary of wiretap's in place of curl's
+random one (same length, so the same size), marked
+`context.request_body = "reconstructed"`. Multipart is not a capturable type
+by default, so those fields are stored only if you add `multipart/form-data`
+to the capturable types, and a configured body path, which cannot be applied
+to multipart, drops such a body rather than keep what it named.
+
 An application's `CURLOPT_HEADERFUNCTION` is chained, never replaced. If it
 is a private or protected method, which curl accepts from the application's
 scope but wiretap cannot call from its own, the transfer is not captured

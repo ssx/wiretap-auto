@@ -49,15 +49,19 @@ if (preg_match('~^/flaky/([a-z0-9]+)~', $_SERVER['REQUEST_URI'], $m)) {
 }
 header('Content-Type: application/json');
 header('X-Test-Server: wiretap');
+// A HEAD response has no body to carry the method in.
+header('X-Method: ' . $_SERVER['REQUEST_METHOD']);
 echo json_encode([
     'method' => $_SERVER['REQUEST_METHOD'],
     'path' => $_SERVER['REQUEST_URI'],
+    // Raw, multipart included: the server runs with post data reading off.
     'body' => file_get_contents('php://input'),
+    'content_type' => $_SERVER['CONTENT_TYPE'] ?? null,
 ]);
 ROUTER);
 
 $server = proc_open(
-    sprintf('exec %s -S 127.0.0.1:%d -t %s', PHP_BINARY, TEST_SERVER_PORT, escapeshellarg($docroot)),
+    sprintf('exec %s -d enable_post_data_reading=0 -S 127.0.0.1:%d -t %s', PHP_BINARY, TEST_SERVER_PORT, escapeshellarg($docroot)),
     [1 => ['file', '/dev/null', 'w'], 2 => ['file', '/dev/null', 'w']],
     $pipes,
 );

@@ -36,11 +36,17 @@ describe('request body reconstruction', function (): void {
             ->and($state->requestBodyIsUnreconstructible())->toBeFalse();
     });
 
-    it('encodes an array body', function (): void {
+    it('writes an array body as the multipart curl sends', function (): void {
         $state = new HandleState();
         $state->set(CURLOPT_POSTFIELDS, ['a' => 1, 'b' => 2]);
 
-        expect($state->requestBody())->toBe('a=1&b=2');
+        $delimiter = '--' . HandleState::MULTIPART_BOUNDARY;
+
+        expect($state->requestBody())->toBe(
+            "{$delimiter}\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n"
+            . "{$delimiter}\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\n2\r\n"
+            . "{$delimiter}--\r\n",
+        );
     });
 
     it('refuses to guess at a file upload', function (): void {
@@ -53,11 +59,20 @@ describe('request body reconstruction', function (): void {
             ->and($state->requestBodyIsUnreconstructible())->toBeTrue();
     });
 
-    it('refuses to guess when a read callback is in use', function (): void {
+    it('refuses to guess when a read callback supplies the body', function (): void {
+        $state = new HandleState();
+        $state->set(CURLOPT_READFUNCTION, static fn () => '');
+        $state->set(CURLOPT_UPLOAD, true);
+
+        expect($state->requestBodyIsUnreconstructible())->toBeTrue();
+    });
+
+    it('knows a read callback sends nothing on a GET', function (): void {
         $state = new HandleState();
         $state->set(CURLOPT_READFUNCTION, static fn () => '');
 
-        expect($state->requestBodyIsUnreconstructible())->toBeTrue();
+        expect($state->requestBodyIsUnreconstructible())->toBeFalse()
+            ->and($state->requestBody())->toBeNull();
     });
 });
 
@@ -181,13 +196,13 @@ describe('hardening found by review', function (): void {
             ->and($state->requestBody())->toBeNull();
     });
 
-    it('reports form encoding for an array body so structural rules can run', function (): void {
-        // A null content type made the redactor attempt JSON parsing on a
-        // form-encoded reconstruction, so body_paths did nothing.
+    it('reports an array body as the multipart curl sends', function (): void {
+        // It was reported as a form, beside a form-encoded reconstruction:
+        // a body and a type the server never received.
         $state = new HandleState();
         $state->set(CURLOPT_POSTFIELDS, ['password' => 'ordinary-secret']);
 
-        expect($state->requestContentType())->toBe('application/x-www-form-urlencoded');
+        expect($state->requestContentType())->toBe('multipart/form-data; boundary=' . HandleState::MULTIPART_BOUNDARY);
     });
 
     it('prefers an explicit Content-Type header over the inferred one', function (): void {
