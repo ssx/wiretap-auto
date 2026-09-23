@@ -64,11 +64,13 @@ describe('request body reconstruction', function (): void {
 describe('configured request headers', function (): void {
     it('reports what curl sends for removal and empty-value forms', function (): void {
         // `Accept:` tells curl not to send its own Accept at all, and
-        // `X-Empty;` sends X-Empty with no value.
+        // `X-Empty;` sends X-Empty with no value. Only a trailing `;` does
+        // that: curl sends nothing for `X-Spaced; `, nor for a line with no
+        // colon at all.
         $state = new HandleState();
-        $state->set(CURLOPT_HTTPHEADER, ['Accept:', 'X-Empty;', 'X-Tenant: alpha']);
+        $state->set(CURLOPT_HTTPHEADER, ['Accept:', 'X-Empty;', 'X-Before ;', 'X-Spaced; ', 'X-Bare', ':x', 'X-Tenant: alpha']);
 
-        expect($state->requestHeaderLines())->toBe(['X-Empty:', 'X-Tenant: alpha']);
+        expect($state->requestHeaderLines())->toBe(['X-Empty:', 'X-Before:', 'X-Tenant: alpha']);
     });
 });
 

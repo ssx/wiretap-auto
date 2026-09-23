@@ -493,3 +493,100 @@ it('honours whichever of HEADERFUNCTION and WRITEHEADER was set last', function 
         ->and((string) stream_get_contents($file))->toContain('Content-Type')
         ->and($this->sink->all()[0]->responseHeaders->has('Content-Type'))->toBeTrue();
 });
+
+it('does not route a private header callback to __call', function (): void {
+    // With a public __call, a private method looks callable from our scope,
+    // but calling it from there reaches __call instead. Its return value
+    // aborted the application's transfer.
+    $recorder = useRecorder($this->sink);
+
+    $sdk = new class ('http://127.0.0.1:' . TEST_SERVER_PORT . '/magic') {
+        /** @var list<string> */
+        public array $log = [];
+
+        public function __construct(private string $url)
+        {
+        }
+
+        public function run(): array
+        {
+            $ch = curl_init($this->url);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_HEADERFUNCTION, [$this, 'onHeader']);
+            $result = curl_exec($ch);
+
+            return [$result, curl_errno($ch)];
+        }
+
+        private function onHeader(\CurlHandle $ch, string $line): int
+        {
+            $this->log[] = 'private';
+
+            return strlen($line);
+        }
+
+        /** @param array<mixed> $args */
+        public function __call(string $name, array $args): int
+        {
+            $this->log[] = '__call';
+
+            return 0;
+        }
+    };
+
+    [$result, $errno] = $sdk->run();
+    $recorder->flush();
+
+    expect($errno)->toBe(0)
+        ->and($result)->toBeString()
+        ->and($sdk->log)->not->toContain('__call')
+        ->and($this->sink->all())->toBeEmpty();
+});
+
+it('declines a handle whose request headers include something other than a string', function (): void {
+    // ext-curl sends a Stringable header. Keeping the list without it made
+    // the record claim headers that were not what was sent, and losing
+    // Content-Type made a JSON body look form-encoded, so bodyPaths
+    // redaction never found its keys.
+    $recorder = useRecorder($this->sink);
+    $header = new class () {
+        public function __toString(): string
+        {
+            return 'X-Stringable: yes';
+        }
+    };
+
+    $ch = curl_init('http://127.0.0.1:' . TEST_SERVER_PORT . '/stringable');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POSTFIELDS => '{"password":"pw"}',
+        CURLOPT_HTTPHEADER => ['Content-Type: application/json', $header],
+    ]);
+    $out = curl_exec($ch);
+    $recorder->flush();
+
+    expect($out)->toBeString()
+        ->and($this->sink->all())->toBeEmpty();
+});
+
+it('does not let a declined copy write its headers into the source state', function (): void {
+    // curl copies our header wrapper onto the copy. Bound to the source's
+    // state, it appended a blocked copy's response headers there, so they
+    // could end up in the source's record.
+    useRecorder(
+        $this->sink,
+        new Blocklist([new ArrayBlocklistProvider(['127.0.0.1/blocked*'])]),
+    );
+    $base = 'http://127.0.0.1:' . TEST_SERVER_PORT;
+    $registry = (fn () => $this->registry)->call(Wiretap::driver());
+
+    $source = curl_init("{$base}/warm");
+    curl_setopt($source, CURLOPT_RETURNTRANSFER, true);
+    curl_exec($source);
+
+    $copy = curl_copy_handle($source);
+    curl_setopt($copy, CURLOPT_URL, "{$base}/blocked");
+    curl_exec($copy);
+
+    expect(substr_count($registry->for($source)->responseHeaders(), 'HTTP/1.'))->toBe(1);
+});
